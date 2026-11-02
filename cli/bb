@@ -1,0 +1,832 @@
+#!/usr/bin/env bash
+# ════════════════════════════════════════════════════════════════════
+#  🔵 BLUEBEAKEND CLI (`bb` / `bluebeakend`) — v1.0.0
+#  Interactive management menu + direct subcommands:
+#    bb                 → Launch interactive 12-option menu
+#    bb status          → Show service health, metrics & system stats
+#    bb apikeys         → Manage project API keys
+#    bb users           → Manage users
+#    bb backup          → Create / list / restore / schedule backups
+#    bb logs [service]  → View container or API logs
+#    bb docs            → Print SDK/curl examples or open Swagger UI
+#    bb version         → Print CLI & server version
+# ════════════════════════════════════════════════════════════════════
+set -euo pipefail
+
+BB_VERSION="1.0.0"
+
+# Locate installation directory (/opt/bluebeakend in prod, or repo root in dev)
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+REPO_GUESS="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+
+if [[ -n "${BB_INSTALL_DIR:-}" ]]; then
+  INSTALL_DIR="$BB_INSTALL_DIR"
+elif [[ -f "/opt/bluebeakend/docker-compose.yml" ]]; then
+  INSTALL_DIR="/opt/bluebeakend"
+else
+  INSTALL_DIR="$REPO_GUESS"
+fi
+
+ENV_FILE="${INSTALL_DIR}/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+BB_DOMAIN="${BB_DOMAIN:-localhost}"
+BB_PROTOCOL="${BB_PROTOCOL:-http}"
+API_URL="${BB_API_URL:-}"
+if [[ -z "$API_URL" ]]; then
+  if curl -fsSL --max-time 2 "http://127.0.0.1:8080/healthz" >/dev/null 2>&1; then
+    API_URL="http://127.0.0.1:8080"
+  elif curl -fsSL --max-time 2 "http://127.0.0.1/healthz" >/dev/null 2>&1; then
+    API_URL="http://127.0.0.1"
+  else
+    API_URL="${BB_PROTOCOL}://${BB_DOMAIN}"
+  fi
+fi
+
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@bluebeakend.local}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
+GITHUB_REPO="${BB_GITHUB_REPO:-siddhantpashte123-hub/beakend}"
+
+# ── ANSI Palette ───────────────────────────────────────────────────
+BLUE='\033[38;5;33m'
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+ADMIN_TOKEN=""
+
+pause_prompt() {
+  echo ""
+  read -r -p "  Press Enter to return to menu… " _ || true
+}
+
+progress_bar() {
+  local pct="$1" label="$2"
+  local filled=$(( pct * 26 / 100 ))
+  local empty=$(( 26 - filled ))
+  local bar=""
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  for ((i=0; i<empty; i++)); do bar+="░"; done
+  echo -e "  ${BLUE}${bar}${NC} ${BOLD}${pct}%${NC}  ${label}"
+}
+
+has_docker_stack() {
+  command -v docker >/dev/null 2>&1 && [[ -f "${INSTALL_DIR}/docker-compose.yml" ]] && \
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" ps --quiet 2>/dev/null | grep -q .
+}
+
+ensure_admin_token() {
+  if [[ -n "$ADMIN_TOKEN" ]]; then
+    return 0
+  fi
+  if [[ -z "$ADMIN_PASSWORD" ]]; then
+    read -r -s -p "  Admin password for ${ADMIN_EMAIL}: " ADMIN_PASSWORD
+    echo ""
+  fi
+  local resp
+  resp="$(curl -fsSL -X POST "${API_URL}/api/v1/admin/login" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -nc --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASSWORD" '{email:$e,password:$p}')" 2>/dev/null || true)"
+  ADMIN_TOKEN="$(echo "$resp" | jq -r '.accessToken // empty' 2>/dev/null || true)"
+  if [[ -z "$ADMIN_TOKEN" ]]; then
+    echo -e "  ${RED}❌ Could not authenticate against ${API_URL}/api/v1/admin/login${NC}"
+    return 1
+  fi
+  return 0
+}
+
+api_admin() {
+  local method="$1" path="$2" body="${3:-}"
+  ensure_admin_token || return 1
+  if [[ -n "$body" ]]; then
+    curl -fsSL -X "$method" "${API_URL}${path}" \
+      -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "$body"
+  else
+    curl -fsSL -X "$method" "${API_URL}${path}" \
+      -H "Authorization: Bearer ${ADMIN_TOKEN}"
+  fi
+}
+
+update_env_var() {
+  local key="$1" val="$2"
+  touch "$ENV_FILE"
+  if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+  else
+    echo "${key}=${val}" >> "$ENV_FILE"
+  fi
+}
+
+format_bytes() {
+  local b="${1:-0}"
+  if (( b >= 1073741824 )); then
+    awk -v b="$b" 'BEGIN {printf "%.1f GB", b/1073741824}'
+  elif (( b >= 1048576 )); then
+    awk -v b="$b" 'BEGIN {printf "%.0f MB", b/1048576}'
+  elif (( b >= 1024 )); then
+    awk -v b="$b" 'BEGIN {printf "%.0f KB", b/1024}'
+  else
+    printf "%d B" "$b"
+  fi
+}
+
+format_uptime() {
+  local s="${1:-0}"
+  local d=$(( s / 86400 ))
+  local h=$(( (s % 86400) / 3600 ))
+  local m=$(( (s % 3600) / 60 ))
+  printf "%dd %dh %dm" "$d" "$h" "$m"
+}
+
+print_banner() {
+  clear 2>/dev/null || true
+  echo -e "${BLUE}${BOLD}"
+  cat <<EOF
+╔══════════════════════════════════════════════════════════════════╗
+║                                                                  ║
+║        ██████╗ ██╗     ██╗   ██╗███████╗                         ║
+║        ██╔══██╗██║     ██║   ██║██╔════╝                         ║
+║        ██████╔╝██║     ██║   ██║█████╗                           ║
+║        ██╔══██╗██║     ██║   ██║██╔══╝                           ║
+║        ██████╔╝███████╗╚██████╔╝███████╗                         ║
+║        ╚═════╝ ╚══════╝ ╚═════╝ ╚══════╝                         ║
+║                                                                  ║
+║              🔵  BLUEBEAKEND  v${BB_VERSION}  🔵                         ║
+║           Self-Hosted Firebase Alternative                       ║
+║                                                                  ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║   [1]  🚀  INSTALL          (Setup on this VPS)                  ║
+║   [2]  🗑️   UNINSTALL        (Remove everything)                  ║
+║   [3]  📊  STATUS           (Health & Metrics)                   ║
+║   [4]  ⬆️   UPDATE           (Pull latest version)                ║
+║   [5]  🔑  API KEYS         (Manage project keys)                ║
+║   [6]  👥  USERS            (Manage users)                       ║
+║   [7]  💾  BACKUP           (Create/Restore backup)              ║
+║   [8]  📜  LOGS             (View live logs)                     ║
+║   [9]  🌐  DOMAIN & SSL     (Configure domain)                   ║
+║   [10] ⚙️   SETTINGS         (SMTP, limits, etc.)                 ║
+║   [11] 📖  DOCS             (Open API docs)                      ║
+║   [12] ❌  EXIT                                                  ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+EOF
+  echo -ne "${NC}"
+}
+
+# ── [1] INSTALL ────────────────────────────────────────────────────
+cmd_install() {
+  if [[ -f "/opt/bluebeakend/.env" ]] && has_docker_stack; then
+    echo -e "\n  ${YELLOW}ℹ️  Already installed at /opt/bluebeakend. Use [4] Update.${NC}"
+    return 0
+  fi
+
+  echo -e "\n  ${BOLD}🚀 Interactive BlueBeakend Setup${NC}\n"
+  local def_ip
+  def_ip="$(curl -4 -fsSL --max-time 3 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")"
+  read -r -p "  Domain (Enter for ${def_ip}): " in_domain
+  read -r -p "  Admin email [admin@bluebeakend.local]: " in_email
+  read -r -s -p "  Admin password (Enter to auto-generate): " in_pass
+  echo ""
+
+  export BB_DOMAIN="${in_domain:-$def_ip}"
+  export BB_ADMIN_EMAIL="${in_email:-admin@bluebeakend.local}"
+  if [[ -n "$in_pass" ]]; then export BB_ADMIN_PASSWORD="$in_pass"; fi
+  export BB_NONINTERACTIVE=1
+  export BB_NO_MENU=1
+
+  progress_bar 25 "Preparing Docker & system dependencies"
+  if [[ -f "${INSTALL_DIR}/install.sh" ]]; then
+    bash "${INSTALL_DIR}/install.sh" --non-interactive --no-menu
+  else
+    echo -e "  ${RED}install.sh not found in ${INSTALL_DIR}${NC}"
+    return 1
+  fi
+}
+
+# ── [2] UNINSTALL ──────────────────────────────────────────────────
+cmd_uninstall() {
+  echo ""
+  echo -e "  ${RED}${BOLD}⚠️  WARNING: This will DELETE all BlueBeakend containers, volumes, and data!${NC}"
+  read -r -p "  Type 'DELETE' to confirm: " confirm
+  if [[ "$confirm" != "DELETE" ]]; then
+    echo "  Aborted."
+    return 0
+  fi
+
+  local backup_path=""
+  read -r -p "  Create backup before uninstall? [Y/n]: " do_bk
+  if [[ "${do_bk:-Y}" =~ ^[Yy]$ ]]; then
+    local ts
+    ts="$(date -u +"%Y%m%d-%H%M%S")"
+    local bk_dir="/root"
+    [[ -w "/root" ]] || bk_dir="$HOME"
+    backup_path="${bk_dir}/bb-backup-${ts}.tar.gz"
+    cmd_create_backup_archive "$backup_path"
+  fi
+
+  if command -v docker >/dev/null 2>&1 && [[ -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
+    echo "  Stopping containers & removing volumes…"
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" down -v --remove-orphans || true
+  fi
+
+  if [[ "$INSTALL_DIR" == "/opt/bluebeakend" ]]; then
+    rm -rf /opt/bluebeakend
+  fi
+  rm -f /usr/local/bin/bb /usr/local/bin/bluebeakend /etc/cron.d/bluebeakend-backup 2>/dev/null || true
+
+  read -r -p "  Remove Docker Engine too? [y/N]: " rm_docker
+  if [[ "${rm_docker:-N}" =~ ^[Yy]$ ]]; then
+    apt-get purge -y docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+  fi
+
+  if [[ -n "$backup_path" ]]; then
+    echo -e "\n  ${GREEN}✅ Uninstalled. Data backed up at ${backup_path}${NC}"
+  else
+    echo -e "\n  ${GREEN}✅ Uninstalled cleanly.${NC}"
+  fi
+  exit 0
+}
+
+# ── [3] STATUS ─────────────────────────────────────────────────────
+cmd_status() {
+  local health_json stats_json
+  health_json="$(curl -fsSL --max-time 4 "${API_URL}/health" 2>/dev/null || echo '{}')"
+  stats_json="$(api_admin GET "/api/v1/admin/stats" 2>/dev/null || echo '{}')"
+
+  local ver uptime_s uptime_str pub_endpoint admin_url
+  ver="$(echo "$health_json" | jq -r '.version // "1.0.0"')"
+  uptime_s="$(echo "$health_json" | jq -r '.uptime // 0')"
+  uptime_str="$(format_uptime "$uptime_s")"
+  pub_endpoint="${BB_PROTOCOL}://${BB_DOMAIN}"
+  admin_url="${pub_endpoint}/admin"
+
+  local users collections documents storage_used storage_quota req_today api_keys
+  users="$(echo "$stats_json" | jq -r '.stats.users // 0')"
+  collections="$(echo "$stats_json" | jq -r '.stats.collections // 0')"
+  documents="$(echo "$stats_json" | jq -r '.stats.documents // 0')"
+  storage_used="$(echo "$stats_json" | jq -r '.stats.storageUsed // 0')"
+  storage_quota="$(echo "$stats_json" | jq -r '.stats.storageQuota // 10737418240')"
+  req_today="$(echo "$stats_json" | jq -r '.stats.requestsToday // 0')"
+  api_keys="$(echo "$stats_json" | jq -r '.stats.apiKeys // 0')"
+
+  local storage_str
+  storage_str="$(format_bytes "$storage_used") / $(format_bytes "$storage_quota")"
+
+  # System metrics
+  local cpu_pct ram_str disk_str
+  cpu_pct="$(awk '/^cpu / {u=$2+$4; t=$2+$4+$5; if(t>0) printf "%.0f%%", u*100/t; else print "1%"}' /proc/stat 2>/dev/null || echo "2%")"
+  ram_str="$(free -h 2>/dev/null | awk '/^Mem:/ {print $3 " / " $2}' || echo "N/A")"
+  disk_str="$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2}' || echo "N/A")"
+
+  echo ""
+  echo -e "  ┌─────────────────────────────────────────────────────────┐"
+  printf  "  │  🔵 %-51s │\n" "BLUEBEAKEND STATUS"
+  echo -e "  ├─────────────────────────────────────────────────────────┤"
+  printf  "  │  Version:        %-38s │\n" "v${ver}"
+  printf  "  │  Uptime:         %-38s │\n" "${uptime_str}"
+  printf  "  │  Domain:         %-38s │\n" "${BB_DOMAIN}"
+  printf  "  │  API Endpoint:   %-38s │\n" "${pub_endpoint}"
+  printf  "  │  Admin Panel:    %-38s │\n" "${admin_url}"
+  echo -e "  ├─────────────────────────────────────────────────────────┤"
+  printf  "  │  %-54s │\n" "SERVICES"
+
+  local services=("api" "postgres" "redis" "minio" "nginx" "realtime")
+  if has_docker_stack; then
+    for svc in "${services[@]}"; do
+      local cid state health mem_cpu
+      cid="$(docker compose -f "${INSTALL_DIR}/docker-compose.yml" ps -q "$svc" 2>/dev/null || true)"
+      if [[ -n "$cid" ]]; then
+        state="$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo "stopped")"
+        health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}healthy{{end}}' "$cid" 2>/dev/null || echo "healthy")"
+        mem_cpu="$(docker stats --no-stream --format '{{.MemUsage}} / {{.CPUPerc}}' "$cid" 2>/dev/null | awk -F'/' '{gsub(/ /,"",$1); gsub(/ /,"",$3); print $1 " / " $3}' || echo "-")"
+        printf "  │  ✅ %-12s %-9s %-9s %-18s │\n" "$svc" "$state" "$health" "$mem_cpu"
+      else
+        printf "  │  ⚪ %-12s %-9s %-9s %-18s │\n" "$svc" "stopped" "-" "-"
+      fi
+    done
+  else
+    local api_ok db_kind cache_kind st_kind
+    api_ok="$(echo "$health_json" | jq -r '.status // "down"')"
+    db_kind="$(echo "$health_json" | jq -r '.services.database.kind // "offline"')"
+    cache_kind="$(echo "$health_json" | jq -r '.services.cache.kind // "offline"')"
+    st_kind="$(echo "$health_json" | jq -r '.services.storage.kind // "offline"')"
+    if [[ "$api_ok" == "ok" ]]; then
+      printf "  │  ✅ %-12s %-9s %-9s %-18s │\n" "api" "running" "healthy" "active"
+      printf "  │  ✅ %-12s %-9s %-9s %-18s │\n" "database" "running" "healthy" "(${db_kind})"
+      printf "  │  ✅ %-12s %-9s %-9s %-18s │\n" "cache" "running" "healthy" "(${cache_kind})"
+      printf "  │  ✅ %-12s %-9s %-9s %-18s │\n" "storage" "running" "healthy" "(${st_kind})"
+      printf "  │  ✅ %-12s %-9s %-9s %-18s │\n" "realtime" "running" "healthy" "ws ready"
+    else
+      printf "  │  ❌ %-12s %-38s │\n" "api" "unreachable (${API_URL})"
+    fi
+  fi
+
+  echo -e "  ├─────────────────────────────────────────────────────────┤"
+  printf  "  │  %-54s │\n" "METRICS"
+  printf  "  │  Users:          %-38s │\n" "${users}"
+  printf  "  │  Collections:    %-38s │\n" "${collections}"
+  printf  "  │  Documents:      %-38s │\n" "${documents}"
+  printf  "  │  Storage Used:   %-38s │\n" "${storage_str}"
+  printf  "  │  Requests Today: %-38s │\n" "${req_today}"
+  printf  "  │  API Keys:       %-38s │\n" "${api_keys} active"
+  echo -e "  ├─────────────────────────────────────────────────────────┤"
+  printf  "  │  %-54s │\n" "SYSTEM"
+  printf  "  │  CPU: %-6s  RAM: %-16s  Disk: %-12s │\n" "${cpu_pct}" "${ram_str}" "${disk_str}"
+  echo -e "  └─────────────────────────────────────────────────────────┘"
+}
+
+# ── [4] UPDATE ─────────────────────────────────────────────────────
+cmd_update() {
+  echo -e "\n  ${BOLD}⬆️  Checking for updates…${NC}"
+  local rel_json latest_tag changelog
+  rel_json="$(curl -fsSL --max-time 6 "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null || echo '{}')"
+  latest_tag="$(echo "$rel_json" | jq -r '.tag_name // empty')"
+  changelog="$(echo "$rel_json" | jq -r '.body // "• Latest main branch improvements & security patches"')"
+  latest_tag="${latest_tag:-v${BB_VERSION}}"
+
+  echo -e "  Current version : ${CYAN}v${BB_VERSION}${NC}"
+  echo -e "  Latest available: ${GREEN}${latest_tag}${NC}"
+  echo -e "\n  ${BOLD}Changelog:${NC}\n  ${changelog}\n"
+
+  read -r -p "  Update from v${BB_VERSION} → ${latest_tag}? [Y/n]: " ans
+  [[ "${ans:-Y}" =~ ^[Yy]$ ]] || return 0
+
+  progress_bar 20 "Creating pre-update safety backup"
+  mkdir -p "${INSTALL_DIR}/backups"
+  cmd_create_backup_archive "${INSTALL_DIR}/backups/bb-pre-update-$(date -u +%Y%m%d-%H%M%S).tar.gz"
+
+  if [[ -d "${INSTALL_DIR}/.git" ]]; then
+    progress_bar 45 "Pulling latest git commits"
+    git -C "$INSTALL_DIR" pull --ff-only || true
+  fi
+
+  if has_docker_stack; then
+    progress_bar 70 "Pulling & rebuilding Docker services"
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" pull || true
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" up -d --build
+    progress_bar 88 "Running PostgreSQL migrations"
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T api npm run migrate || true
+  fi
+
+  progress_bar 100 "Verifying healthcheck"
+  curl -fsSL --max-time 10 "${API_URL}/healthz" >/dev/null 2>&1 || true
+  echo -e "\n  ${GREEN}✅ Updated to ${latest_tag}${NC}"
+}
+
+# ── [5] API KEYS ───────────────────────────────────────────────────
+cmd_apikeys() {
+  while true; do
+    echo ""
+    echo -e "  ${BOLD}🔑 API KEYS MANAGEMENT${NC}"
+    echo "    1) List all API keys"
+    echo "    2) Create new API key"
+    echo "    3) Revoke API key"
+    echo "    4) Show Firebase-style config for a key"
+    echo "    0) Back to main menu"
+    read -r -p "  Select [0-4]: " sub
+    case "$sub" in
+      1)
+        local data
+        data="$(api_admin GET "/api/v1/admin/apikeys")" || continue
+        echo ""
+        printf "  %-36s  %-22s  %-10s  %-8s  %s\n" "ID" "PROJECT" "STATUS" "REQS" "KEY"
+        echo "  ────────────────────────────────────────────────────────────────────────────────────────────────────"
+        echo "$data" | jq -r '.apiKeys[] | "  \(.id)  \(.name | .[0:22])  \(.status)  \(.requestsCount)  \(.key)"'
+        ;;
+      2)
+        read -r -p "  Enter project name (e.g. my-flutter-app): " pname
+        [[ -n "$pname" ]] || continue
+        local created
+        created="$(api_admin POST "/api/v1/admin/apikeys" "$(jq -nc --arg n "$pname" '{name:$n}')")" || continue
+        echo -e "\n  ${GREEN}✅ Created API Key:${NC} $(echo "$created" | jq -r '.apiKey')"
+        echo -e "  ${BOLD}Firebase-style SDK Config:${NC}"
+        echo "$created" | jq '.config'
+        ;;
+      3)
+        read -r -p "  Enter API key ID to revoke: " kid
+        [[ -n "$kid" ]] || continue
+        api_admin DELETE "/api/v1/admin/apikeys/${kid}" >/dev/null && \
+          echo -e "  ${GREEN}✅ Key ${kid} revoked.${NC}"
+        ;;
+      4)
+        local data
+        data="$(api_admin GET "/api/v1/admin/apikeys")" || continue
+        read -r -p "  Project name (or press Enter for first active key): " pname
+        if [[ -n "$pname" ]]; then
+          echo "$data" | jq --arg n "$pname" '.apiKeys[] | select(.name == $n) | .config'
+        else
+          echo "$data" | jq '.apiKeys | map(select(.status=="active")) | .[0].config'
+        fi
+        ;;
+      0|"") break ;;
+    esac
+  done
+}
+
+# ── [6] USERS ──────────────────────────────────────────────────────
+cmd_users() {
+  while true; do
+    echo ""
+    echo -e "  ${BOLD}👥 USER MANAGEMENT${NC}"
+    echo "    1) List users"
+    echo "    2) Create user manually"
+    echo "    3) Reset user password"
+    echo "    4) Ban / unban user"
+    echo "    5) Delete user"
+    echo "    0) Back to main menu"
+    read -r -p "  Select [0-5]: " sub
+    case "$sub" in
+      1)
+        local data
+        data="$(api_admin GET "/api/v1/admin/users?limit=50")" || continue
+        echo ""
+        printf "  %-36s  %-28s  %-8s  %-8s  %s\n" "ID" "EMAIL" "ROLE" "STATUS" "LAST LOGIN"
+        echo "  ────────────────────────────────────────────────────────────────────────────────────────────────────"
+        echo "$data" | jq -r '.users[] | "  \(.id)  \(.email)  \(.role)  \(.status)  \(.lastLoginAt // "never")"'
+        ;;
+      2)
+        read -r -p "  Email: " uemail
+        read -r -p "  Name (optional): " uname
+        read -r -s -p "  Password (min 6 chars, Enter to auto-generate): " upass
+        echo ""
+        local payload
+        if [[ -n "$upass" ]]; then
+          payload="$(jq -nc --arg e "$uemail" --arg n "$uname" --arg p "$upass" '{email:$e,name:$n,password:$p}')"
+        else
+          payload="$(jq -nc --arg e "$uemail" --arg n "$uname" '{email:$e,name:$n}')"
+        fi
+        local res
+        res="$(api_admin POST "/api/v1/admin/users" "$payload")" || continue
+        echo -e "  ${GREEN}✅ User created:${NC} $(echo "$res" | jq -r '.user.id')"
+        local tmp_pw
+        tmp_pw="$(echo "$res" | jq -r '.temporaryPassword // empty')"
+        [[ -n "$tmp_pw" ]] && echo -e "  ${YELLOW}Temporary password: ${tmp_pw}${NC}"
+        ;;
+      3)
+        read -r -p "  User ID: " uid
+        read -r -s -p "  New password (min 6 chars): " npw
+        echo ""
+        api_admin PATCH "/api/v1/admin/users/${uid}" "$(jq -nc --arg p "$npw" '{password:$p}')" >/dev/null && \
+          echo -e "  ${GREEN}✅ Password updated & sessions revoked.${NC}"
+        ;;
+      4)
+        read -r -p "  User ID: " uid
+        read -r -p "  New status [banned/active]: " st
+        api_admin PATCH "/api/v1/admin/users/${uid}" "$(jq -nc --arg s "$st" '{status:$s}')" >/dev/null && \
+          echo -e "  ${GREEN}✅ User status set to ${st}.${NC}"
+        ;;
+      5)
+        read -r -p "  User ID to delete: " uid
+        api_admin DELETE "/api/v1/admin/users/${uid}" >/dev/null && \
+          echo -e "  ${GREEN}✅ User deleted.${NC}"
+        ;;
+      0|"") break ;;
+    esac
+  done
+}
+
+# ── [7] BACKUP ─────────────────────────────────────────────────────
+cmd_create_backup_archive() {
+  local dest="$1"
+  local work
+  work="$(mktemp -d)"
+  mkdir -p "$(dirname "$dest")"
+
+  if has_docker_stack; then
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T postgres \
+      pg_dump -U "${POSTGRES_USER:-bluebeakend}" "${POSTGRES_DB:-bluebeakend}" > "${work}/postgres.sql" 2>/dev/null || true
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T minio \
+      sh -c 'tar -cf - /data 2>/dev/null' > "${work}/minio.tar" 2>/dev/null || true
+  fi
+
+  # Also request an online JSON snapshot from the API if reachable
+  api_admin POST "/api/v1/admin/backups" >/dev/null 2>&1 || true
+  [[ -f "$ENV_FILE" ]] && cp "$ENV_FILE" "${work}/env.backup"
+
+  tar -C "$work" -czf "$dest" .
+  rm -rf "$work"
+  echo -e "  ${GREEN}✅ Backup saved: ${dest}${NC}"
+}
+
+cmd_backup() {
+  local bk_dir="${INSTALL_DIR}/backups"
+  mkdir -p "$bk_dir"
+  while true; do
+    echo ""
+    echo -e "  ${BOLD}💾 BACKUP & RECOVERY${NC}"
+    echo "    1) Create backup now (pg_dump + MinIO + API snapshot)"
+    echo "    2) List backups"
+    echo "    3) Restore from backup"
+    echo "    4) Schedule auto-backup (daily / weekly)"
+    echo "    0) Back to main menu"
+    read -r -p "  Select [0-4]: " sub
+    case "$sub" in
+      1)
+        local target="${bk_dir}/bb-backup-$(date -u +%Y%m%d-%H%M%S).tar.gz"
+        cmd_create_backup_archive "$target"
+        ;;
+      2)
+        echo -e "\n  ${BOLD}Backups in ${bk_dir}:${NC}"
+        ls -lh "$bk_dir" 2>/dev/null || echo "  (empty)"
+        ;;
+      3)
+        ls -1 "$bk_dir" 2>/dev/null || true
+        read -r -p "  Enter backup filename to restore: " bname
+        [[ -n "$bname" ]] || continue
+        if [[ "$bname" == *.json.gz ]]; then
+          api_admin POST "/api/v1/admin/backups/${bname}/restore" >/dev/null && \
+            echo -e "  ${GREEN}✅ Online snapshot restored.${NC}"
+        elif [[ -f "${bk_dir}/${bname}" ]] && has_docker_stack; then
+          local work
+          work="$(mktemp -d)"
+          tar -C "$work" -xzf "${bk_dir}/${bname}"
+          if [[ -f "${work}/postgres.sql" ]]; then
+            docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T postgres \
+              psql -U "${POSTGRES_USER:-bluebeakend}" -d "${POSTGRES_DB:-bluebeakend}" < "${work}/postgres.sql" >/dev/null
+          fi
+          rm -rf "$work"
+          echo -e "  ${GREEN}✅ Archive ${bname} restored.${NC}"
+        else
+          echo -e "  ${RED}Backup file not found: ${bk_dir}/${bname}${NC}"
+        fi
+        ;;
+      4)
+        read -r -p "  Schedule [daily/weekly/off]: " sched
+        case "$sched" in
+          daily)
+            if [[ -w /etc/cron.d ]]; then
+              echo "0 3 * * * root /usr/local/bin/bb backup-now >/dev/null 2>&1" > /etc/cron.d/bluebeakend-backup
+            fi
+            api_admin PATCH "/api/v1/admin/settings" '{"autoBackupSchedule":"daily"}' >/dev/null 2>&1 || true
+            echo -e "  ${GREEN}✅ Scheduled daily auto-backup at 03:00 UTC.${NC}"
+            ;;
+          weekly)
+            if [[ -w /etc/cron.d ]]; then
+              echo "0 3 * * 0 root /usr/local/bin/bb backup-now >/dev/null 2>&1" > /etc/cron.d/bluebeakend-backup
+            fi
+            api_admin PATCH "/api/v1/admin/settings" '{"autoBackupSchedule":"weekly"}' >/dev/null 2>&1 || true
+            echo -e "  ${GREEN}✅ Scheduled weekly Sunday auto-backup at 03:00 UTC.${NC}"
+            ;;
+          off)
+            rm -f /etc/cron.d/bluebeakend-backup 2>/dev/null || true
+            api_admin PATCH "/api/v1/admin/settings" '{"autoBackupSchedule":"off"}' >/dev/null 2>&1 || true
+            echo -e "  ${YELLOW}Auto-backup disabled.${NC}"
+            ;;
+        esac
+        ;;
+      0|"") break ;;
+    esac
+  done
+}
+
+# ── [8] LOGS ───────────────────────────────────────────────────────
+cmd_logs() {
+  local svc="${1:-}"
+  if [[ -z "$svc" ]]; then
+    echo ""
+    read -r -p "  Service [all/api/postgres/redis/minio/nginx/realtime] (default: all): " svc
+    svc="${svc:-all}"
+  fi
+  local grep_pat=""
+  if [[ -t 0 && $# -eq 0 ]]; then
+    read -r -p "  Optional grep filter (Enter for none): " grep_pat
+    read -r -p "  Follow live stream? [y/N]: " follow
+  else
+    follow="N"
+  fi
+
+  if has_docker_stack; then
+    local args=(--tail=100)
+    [[ "${follow:-N}" =~ ^[Yy]$ ]] && args+=(-f)
+    [[ "$svc" != "all" ]] && args+=("$svc")
+    if [[ -n "$grep_pat" ]]; then
+      docker compose -f "${INSTALL_DIR}/docker-compose.yml" logs "${args[@]}" | grep --color=auto -i "$grep_pat" || true
+    else
+      docker compose -f "${INSTALL_DIR}/docker-compose.yml" logs "${args[@]}"
+    fi
+  else
+    local qparam=""
+    [[ -n "$grep_pat" ]] && qparam="&q=${grep_pat}"
+    [[ "$svc" != "all" ]] && qparam="${qparam}&service=${svc}"
+    api_admin GET "/api/v1/admin/logs?limit=100${qparam}" | \
+      jq -r '.logs | reverse | .[] | "[\(.ts)] \(.level | ascii_upcase) [\(.service)] \(.msg)"'
+  fi
+}
+
+# ── [9] DOMAIN & SSL ───────────────────────────────────────────────
+cmd_domain_ssl() {
+  echo ""
+  echo -e "  ${BOLD}🌐 DOMAIN & SSL (Nginx + Let's Encrypt)${NC}"
+  echo "    1) Set domain & provision Let's Encrypt SSL"
+  echo "    2) Toggle Force HTTPS redirect"
+  echo "    3) Renew SSL certificates now"
+  echo "    0) Back"
+  read -r -p "  Select [0-3]: " sub
+  case "$sub" in
+    1)
+      read -r -p "  Enter domain (e.g. api.myapp.com): " new_dom
+      read -r -p "  Let's Encrypt email [${ADMIN_EMAIL}]: " le_email
+      le_email="${le_email:-$ADMIN_EMAIL}"
+      [[ -n "$new_dom" ]] || return 0
+      update_env_var "BB_DOMAIN" "$new_dom"
+      update_env_var "BB_PROTOCOL" "https"
+      BB_DOMAIN="$new_dom"
+      BB_PROTOCOL="https"
+      api_admin PATCH "/api/v1/admin/settings" "$(jq -nc --arg d "$new_dom" '{domain:$d}')" >/dev/null 2>&1 || true
+
+      if has_docker_stack; then
+        docker compose -f "${INSTALL_DIR}/docker-compose.yml" run --rm certbot \
+          certonly --webroot -w /var/www/certbot -d "$new_dom" --email "$le_email" --agree-tos --non-interactive && {
+          sed -i "s|/etc/nginx/ssl/live/bluebeakend/|/etc/nginx/ssl/live/${new_dom}/|g" "${INSTALL_DIR}/nginx/bluebeakend.conf"
+          sed -i 's|# __HTTPS_REDIRECT_MARKER__.*|location / { return 301 https://$host$request_uri; }|' "${INSTALL_DIR}/nginx/bluebeakend.conf"
+          docker compose -f "${INSTALL_DIR}/docker-compose.yml" up -d api realtime nginx
+          docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T nginx nginx -s reload || true
+          echo -e "  ${GREEN}✅ HTTPS active at https://${new_dom}${NC}"
+        }
+      else
+        echo -e "  ${GREEN}✅ Domain updated to ${new_dom} in configuration.${NC}"
+      fi
+      ;;
+    2)
+      if grep -q "return 301 https://" "${INSTALL_DIR}/nginx/bluebeakend.conf" 2>/dev/null; then
+        sed -i 's|location / { return 301 https://\$host\$request_uri; }|# __HTTPS_REDIRECT_MARKER__|' "${INSTALL_DIR}/nginx/bluebeakend.conf"
+        echo -e "  ${YELLOW}Force HTTPS redirect disabled.${NC}"
+      else
+        sed -i 's|# __HTTPS_REDIRECT_MARKER__.*|location / { return 301 https://$host$request_uri; }|' "${INSTALL_DIR}/nginx/bluebeakend.conf"
+        echo -e "  ${GREEN}Force HTTPS redirect enabled.${NC}"
+      fi
+      has_docker_stack && docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T nginx nginx -s reload || true
+      ;;
+    3)
+      if has_docker_stack; then
+        docker compose -f "${INSTALL_DIR}/docker-compose.yml" run --rm certbot renew
+        docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T nginx nginx -s reload
+        echo -e "  ${GREEN}✅ SSL certificates renewed.${NC}"
+      else
+        echo -e "  ${YELLOW}Docker stack not active on this host.${NC}"
+      fi
+      ;;
+  esac
+}
+
+# ── [10] SETTINGS ──────────────────────────────────────────────────
+cmd_settings() {
+  echo ""
+  echo -e "  ${BOLD}⚙️  PLATFORM SETTINGS${NC}"
+  local cur
+  cur="$(api_admin GET "/api/v1/admin/settings" 2>/dev/null || echo '{}')"
+  echo "$cur" | jq '.settings // {}'
+  echo ""
+  echo "    1) Configure SMTP"
+  echo "    2) Set Rate Limit (RPM)"
+  echo "    3) Set Max Storage Quota (GB)"
+  echo "    4) Enable / Disable Public Signups"
+  echo "    5) Set CORS Allowed Origins"
+  echo "    0) Back"
+  read -r -p "  Select [0-5]: " sub
+  case "$sub" in
+    1)
+      read -r -p "  SMTP Host: " shost
+      read -r -p "  SMTP Port [587]: " sport
+      read -r -p "  SMTP User: " suser
+      read -r -s -p "  SMTP Password: " spass
+      echo ""
+      sport="${sport:-587}"
+      update_env_var "SMTP_HOST" "$shost"
+      update_env_var "SMTP_PORT" "$sport"
+      update_env_var "SMTP_USER" "$suser"
+      update_env_var "SMTP_PASS" "$spass"
+      api_admin PATCH "/api/v1/admin/settings" \
+        "$(jq -nc --arg h "$shost" --argjson p "$sport" --arg u "$suser" --arg pw "$spass" '{smtpHost:$h,smtpPort:$p,smtpUser:$u,smtpPass:$pw}')" >/dev/null
+      echo -e "  ${GREEN}✅ SMTP settings saved.${NC}"
+      ;;
+    2)
+      read -r -p "  Requests per minute [600]: " rpm
+      [[ -n "$rpm" ]] || return 0
+      update_env_var "RATE_LIMIT_RPM" "$rpm"
+      api_admin PATCH "/api/v1/admin/settings" "$(jq -nc --argjson r "$rpm" '{rateLimitRpm:$r}')" >/dev/null
+      echo -e "  ${GREEN}✅ Rate limit updated to ${rpm} req/min.${NC}"
+      ;;
+    3)
+      read -r -p "  Max storage quota in GB [10]: " gb
+      [[ -n "$gb" ]] || return 0
+      local bytes=$(( gb * 1024 * 1024 * 1024 ))
+      api_admin PATCH "/api/v1/admin/settings" "$(jq -nc --argjson b "$bytes" '{maxStorageBytes:$b}')" >/dev/null
+      echo -e "  ${GREEN}✅ Storage quota set to ${gb} GB.${NC}"
+      ;;
+    4)
+      read -r -p "  Enable public user signups? [true/false]: " en
+      update_env_var "ENABLE_SIGNUPS" "$en"
+      api_admin PATCH "/api/v1/admin/settings" "$(jq -nc --argjson e "$en" '{enableSignups:$e}')" >/dev/null
+      echo -e "  ${GREEN}✅ Public signups = ${en}.${NC}"
+      ;;
+    5)
+      read -r -p "  CORS Allowed Origins (* or comma-separated): " origins
+      update_env_var "CORS_ORIGINS" "$origins"
+      api_admin PATCH "/api/v1/admin/settings" "$(jq -nc --arg o "$origins" '{corsOrigins:$o}')" >/dev/null
+      echo -e "  ${GREEN}✅ CORS origins updated.${NC}"
+      ;;
+  esac
+}
+
+# ── [11] DOCS ──────────────────────────────────────────────────────
+cmd_docs() {
+  local docs_url="${API_URL}/docs"
+  local sample_key="${API_KEY:-bb_live_your_api_key}"
+  echo ""
+  echo -e "  ${BOLD}📖 BLUEBEAKEND API DOCS${NC}"
+  echo -e "  Swagger UI  : ${CYAN}${docs_url}${NC}"
+  echo -e "  OpenAPI Spec: ${CYAN}${API_URL}/openapi.json${NC}"
+  echo -e "  Admin Panel : ${CYAN}${API_URL}/admin${NC}"
+  echo ""
+  echo -e "  ${BOLD}Quickstart cURL Examples:${NC}"
+  cat <<EOF
+  # 1. Healthcheck
+  curl ${API_URL}/health
+
+  # 2. Register a user
+  curl -X POST ${API_URL}/api/v1/auth/register \\
+    -H "X-API-Key: ${sample_key}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"email":"dev@app.com","password":"secret123"}'
+
+  # 3. Add a document
+  curl -X POST ${API_URL}/api/v1/db/todos \\
+    -H "X-API-Key: ${sample_key}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"title":"Buy milk","done":false}'
+EOF
+
+  if command -v xdg-open >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    xdg-open "$docs_url" >/dev/null 2>&1 || true
+  elif command -v open >/dev/null 2>&1; then
+    open "$docs_url" >/dev/null 2>&1 || true
+  fi
+}
+
+# ── Direct CLI subcommand routing ──────────────────────────────────
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    status)     cmd_status ;;
+    install)    cmd_install ;;
+    uninstall)  cmd_uninstall ;;
+    update)     cmd_update ;;
+    apikeys)    cmd_apikeys ;;
+    users)      cmd_users ;;
+    backup)     cmd_backup ;;
+    backup-now) mkdir -p "${INSTALL_DIR}/backups" && cmd_create_backup_archive "${INSTALL_DIR}/backups/bb-backup-$(date -u +%Y%m%d-%H%M%S).tar.gz" ;;
+    logs)       shift; cmd_logs "${1:-all}" ;;
+    domain)     cmd_domain_ssl ;;
+    settings)   cmd_settings ;;
+    docs)       cmd_docs ;;
+    version|--version|-v) echo "BlueBeakend CLI v${BB_VERSION}" ;;
+    help|--help|-h)
+      echo "Usage: bb [status|install|uninstall|update|apikeys|users|backup|logs|domain|settings|docs|version]"
+      echo "Run 'bb' without arguments to open the interactive menu."
+      ;;
+    *)
+      echo "Unknown command: $1 (try 'bb --help')" >&2
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
+
+# ── Interactive Main Menu Loop ─────────────────────────────────────
+while true; do
+  print_banner
+  read -r -p "  Enter your choice [1-12]: " choice || exit 0
+  case "$choice" in
+    1)  cmd_install;    pause_prompt ;;
+    2)  cmd_uninstall;  pause_prompt ;;
+    3)  cmd_status;     pause_prompt ;;
+    4)  cmd_update;     pause_prompt ;;
+    5)  cmd_apikeys ;;
+    6)  cmd_users ;;
+    7)  cmd_backup ;;
+    8)  cmd_logs;       pause_prompt ;;
+    9)  cmd_domain_ssl; pause_prompt ;;
+    10) cmd_settings;   pause_prompt ;;
+    11) cmd_docs;       pause_prompt ;;
+    12|q|exit)
+      echo -e "\n  ${CYAN}👋 Goodbye! Run 'bb' anytime.${NC}\n"
+      exit 0
+      ;;
+    *)
+      echo -e "  ${YELLOW}Please enter a number between 1 and 12.${NC}"
+      sleep 1
+      ;;
+  esac
+done
