@@ -265,7 +265,9 @@ button:disabled {
 // "⚙ Connection" bar inside the page (saved in localStorage).
 // =========================================================
 
-const DEFAULT_API_URL = "https://automatic-space-capybara-544w6j4gp47f754r-80.app.github.dev";
+const DEFAULT_API_URL = (window.location.protocol.startsWith("http") && window.location.pathname.startsWith("/chat"))
+    ? window.location.origin
+    : "https://automatic-space-capybara-544w6j4gp47f754r-80.app.github.dev";
 const DEFAULT_API_KEY = ""; // Optional: put your "bb_live_..." key here, or paste via UI
 const COLLECTION_NAME = "messages";
 
