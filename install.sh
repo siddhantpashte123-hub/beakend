@@ -149,6 +149,73 @@ else
   yum install -y -q ca-certificates curl git jq openssl tar gzip firewalld >/dev/null
 fi
 
+ensure_docker_proxy() {
+  docker info >/dev/null 2>&1 || return 0
+
+  if [[ -x /usr/libexec/docker/docker-proxy && -x /usr/bin/docker-proxy ]]; then
+    return 0
+  fi
+
+  local found_proxy=""
+  local cand
+  for cand in \
+    /usr/libexec/docker/docker-proxy \
+    /usr/bin/docker-proxy \
+    /usr/sbin/docker-proxy \
+    /usr/local/bin/docker-proxy \
+    "$(command -v docker-proxy 2>/dev/null || true)"; do
+    if [[ -n "$cand" && -x "$cand" ]]; then
+      found_proxy="$cand"
+      break
+    fi
+  done
+
+  # If an apt package transition (e.g. moby-engine <-> docker-compose-plugin in Codespaces/Ubuntu 24.04)
+  # unlinked docker-proxy while dockerd stayed running, extract the static binary without restarting dockerd.
+  if [[ -z "$found_proxy" && "${PKG_MGR:-}" == "apt" ]]; then
+    info "Restoring missing docker-proxy helper binary…"
+    local tmpd
+    tmpd="$(mktemp -d)"
+    chmod 777 "$tmpd"
+    (
+      cd "$tmpd"
+      apt-get download moby-engine >/dev/null 2>&1 || \
+        apt-get download docker-ce >/dev/null 2>&1 || \
+        apt-get download docker.io >/dev/null 2>&1 || true
+      for deb in ./*.deb; do
+        [[ -f "$deb" ]] || continue
+        dpkg-deb --fsys-tarfile "$deb" > pkg.tar 2>/dev/null || continue
+        tar -xf pkg.tar --wildcards '*docker-proxy' 2>/dev/null || true
+      done
+    )
+    found_proxy="$(find "$tmpd" -type f -name 'docker-proxy' | head -n 1 || true)"
+    if [[ -n "$found_proxy" ]]; then
+      mkdir -p /usr/libexec/docker /usr/bin
+      install -m 0755 "$found_proxy" /usr/libexec/docker/docker-proxy
+      ln -sf /usr/libexec/docker/docker-proxy /usr/bin/docker-proxy
+      rm -rf "$tmpd"
+      ok "Restored /usr/libexec/docker/docker-proxy"
+      return 0
+    fi
+    rm -rf "$tmpd"
+  fi
+
+  # Fallback: copy static Go docker-proxy binary from official docker:dind image (no port mapping needed)
+  if [[ -z "$found_proxy" ]]; then
+    info "Provisioning static docker-proxy helper via Docker…"
+    mkdir -p /usr/libexec/docker
+    docker run --rm --entrypoint sh -v /usr/libexec/docker:/out docker:dind \
+      -c 'cp "$(command -v docker-proxy)" /out/docker-proxy && chmod 0755 /out/docker-proxy' >/dev/null 2>&1 || true
+    [[ -x /usr/libexec/docker/docker-proxy ]] && found_proxy="/usr/libexec/docker/docker-proxy"
+  fi
+
+  if [[ -n "$found_proxy" ]]; then
+    mkdir -p /usr/libexec/docker /usr/bin
+    [[ ! -e /usr/libexec/docker/docker-proxy ]] && ln -sf "$found_proxy" /usr/libexec/docker/docker-proxy
+    [[ ! -e /usr/bin/docker-proxy ]] && ln -sf "$found_proxy" /usr/bin/docker-proxy
+  fi
+}
+
 if ! command -v docker >/dev/null 2>&1; then
   info "Installing Docker Engine…"
   curl -fsSL https://get.docker.com | sh
@@ -162,12 +229,26 @@ fi
 if ! docker compose version >/dev/null 2>&1; then
   info "Installing Docker Compose v2 plugin…"
   if [[ "$PKG_MGR" == "apt" ]]; then
-    apt-get install -y -qq docker-compose-plugin >/dev/null
+    if dpkg -s moby-cli >/dev/null 2>&1; then
+      apt-get install -y -qq moby-compose >/dev/null 2>&1 || true
+    else
+      apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || true
+    fi
   else
     dnf install -y -q docker-compose-plugin >/dev/null || true
   fi
+  if ! docker compose version >/dev/null 2>&1; then
+    COMPOSE_ARCH="x86_64"
+    [[ "$ARCH" == "arm64" ]] && COMPOSE_ARCH="aarch64"
+    mkdir -p /usr/local/lib/docker/cli-plugins /usr/libexec/docker/cli-plugins
+    curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${COMPOSE_ARCH}" \
+      -o /usr/local/lib/docker/cli-plugins/docker-compose
+    chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+    ln -sf /usr/local/lib/docker/cli-plugins/docker-compose /usr/libexec/docker/cli-plugins/docker-compose
+  fi
 fi
 docker compose version >/dev/null 2>&1 || fatal "Docker Compose v2 is not available after installation."
+ensure_docker_proxy
 ok "Docker & Docker Compose v2 ready"
 
 # ── 4 & 5. Create /opt/bluebeakend & clone/pull stack ──────────────
@@ -294,6 +375,10 @@ else
   info "Existing .env detected — preserving existing secrets"
   if [[ -n "${BB_DOMAIN:-}" ]]; then
     sed -i "s|^BB_DOMAIN=.*|BB_DOMAIN=${BB_DOMAIN}|" "${INSTALL_DIR}/.env"
+  elif [[ -n "$CS_NAME" && -n "$DETECTED_IP" ]] && grep -q "^BB_DOMAIN=${DETECTED_IP}$" "${INSTALL_DIR}/.env" 2>/dev/null; then
+    # Upgrade NAT IP from an earlier partial Codespace run to the forwarded Codespaces HTTPS hostname
+    sed -i "s|^BB_DOMAIN=.*|BB_DOMAIN=${DEFAULT_HOST}|" "${INSTALL_DIR}/.env"
+    sed -i "s|^BB_PROTOCOL=.*|BB_PROTOCOL=https|" "${INSTALL_DIR}/.env"
   fi
 fi
 
@@ -322,7 +407,14 @@ done
 
 # ── 8. Build core image once & launch Docker Compose stack ─────────
 progress_bar 68 "Building BlueBeakend core image (Admin UI + API + Realtime + S3)"
+ensure_docker_proxy
 docker compose build api
+
+# Clear any stopped nginx container from a failed prior port-mapping attempt so libnetwork allocates cleanly
+NGINX_CID="$(docker compose ps -a -q nginx 2>/dev/null || true)"
+if [[ -n "$NGINX_CID" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$NGINX_CID" 2>/dev/null || echo false)" != "true" ]]; then
+  docker compose rm -sf nginx >/dev/null 2>&1 || true
+fi
 
 progress_bar 78 "Starting PostgreSQL, Redis, S3 Storage, API, Realtime & Nginx"
 docker compose up -d --remove-orphans
