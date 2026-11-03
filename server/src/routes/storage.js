@@ -261,7 +261,10 @@ export async function storageRoutes(app, ctx) {
     if (!file.isPublic && !isOwner && !isAdmin) throw forbidden('You do not own this file');
 
     let url;
-    if (storage.kind === 'minio') {
+    // Only return raw S3 presigned URLs when S3_ENDPOINT is a publicly routable domain
+    // (not internal Docker network hostname `http://minio:9000`).
+    const isInternalS3 = !config.s3.endpoint || /^https?:\/\/(minio|localhost|127\.0\.0\.1)(:|\/|$)/i.test(config.s3.endpoint);
+    if (storage.kind === 'minio' && !isInternalS3) {
       url = await storage.signedUrl(file.storageKey, id, 3600);
     } else {
       url = makeSignedDownloadUrl(req, id, 3600, inline === '1');
