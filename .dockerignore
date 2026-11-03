@@ -1,0 +1,12 @@
+# Exclude local dev artifacts, git history & runtime volumes from Docker build context
+.git
+.gitignore
+**/node_modules
+admin/.next
+admin/out
+backups
+storage-data
+nginx/ssl
+.env
+credentials.txt
+*.log

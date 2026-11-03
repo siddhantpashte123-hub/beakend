@@ -374,8 +374,9 @@ cmd_update() {
 
   if has_docker_stack; then
     progress_bar 70 "Pulling & rebuilding Docker services"
-    docker compose -f "${INSTALL_DIR}/docker-compose.yml" pull || true
-    docker compose -f "${INSTALL_DIR}/docker-compose.yml" up -d --build
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" pull --ignore-buildable || true
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" build api
+    docker compose -f "${INSTALL_DIR}/docker-compose.yml" up -d --remove-orphans
     progress_bar 88 "Running PostgreSQL migrations"
     docker compose -f "${INSTALL_DIR}/docker-compose.yml" exec -T api npm run migrate || true
   fi

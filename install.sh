@@ -8,9 +8,12 @@
 #
 #  Environment overrides (optional):
 #    BB_DOMAIN=api.myapp.com
+#    BB_HTTP_PORT=80
+#    BB_HTTPS_PORT=443
 #    BB_ADMIN_EMAIL=admin@myapp.com
 #    BB_INSTALL_DIR=/opt/bluebeakend
 #    BB_REPO_URL=https://github.com/siddhantpashte123-hub/beakend.git
+#    BB_REPO_BRANCH=main
 #    BB_NONINTERACTIVE=1
 #    BB_SKIP_CHECKS=1
 #    BB_NO_MENU=1
@@ -23,6 +26,8 @@ REPO_URL="${BB_REPO_URL:-https://github.com/siddhantpashte123-hub/beakend.git}"
 REPO_BRANCH="${BB_REPO_BRANCH:-main}"
 NONINTERACTIVE="${BB_NONINTERACTIVE:-0}"
 SKIP_CHECKS="${BB_SKIP_CHECKS:-0}"
+HTTP_PORT="${BB_HTTP_PORT:-80}"
+HTTPS_PORT="${BB_HTTPS_PORT:-443}"
 
 # ── ANSI Colors ────────────────────────────────────────────────────
 BLUE='\033[38;5;33m'
@@ -147,9 +152,11 @@ fi
 if ! command -v docker >/dev/null 2>&1; then
   info "Installing Docker Engine…"
   curl -fsSL https://get.docker.com | sh
-  systemctl enable --now docker
+  systemctl enable --now docker 2>/dev/null || service docker start 2>/dev/null || true
 else
-  systemctl start docker 2>/dev/null || true
+  if ! docker info >/dev/null 2>&1; then
+    systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true
+  fi
 fi
 
 if ! docker compose version >/dev/null 2>&1; then
@@ -174,14 +181,21 @@ fi
 
 if [[ -n "$SCRIPT_SRC_DIR" && "$SCRIPT_SRC_DIR" != "$INSTALL_DIR" ]]; then
   info "Copying stack from local checkout (${SCRIPT_SRC_DIR})…"
-  tar -C "$SCRIPT_SRC_DIR" --exclude='./node_modules' --exclude='./*/node_modules' --exclude='./.git' -cf - . \
-    | tar -C "$INSTALL_DIR" -xf -
+  tar -C "$SCRIPT_SRC_DIR" \
+    --exclude='./node_modules' \
+    --exclude='./*/node_modules' \
+    --exclude='./admin/.next' \
+    --exclude='./admin/out' \
+    --exclude='./.git' \
+    -cf - . | tar -C "$INSTALL_DIR" -xf -
 elif [[ -d "${INSTALL_DIR}/.git" ]]; then
-  info "Updating existing repository in ${INSTALL_DIR}…"
-  git -C "${INSTALL_DIR}" fetch --all --prune
-  git -C "${INSTALL_DIR}" pull --ff-only || true
+  info "Updating existing repository in ${INSTALL_DIR} (${REPO_BRANCH})…"
+  git -C "${INSTALL_DIR}" remote set-url origin "${REPO_URL}" 2>/dev/null || true
+  git -C "${INSTALL_DIR}" fetch origin "${REPO_BRANCH}" --depth 1
+  git -C "${INSTALL_DIR}" checkout -B "${REPO_BRANCH}" FETCH_HEAD
+  git -C "${INSTALL_DIR}" reset --hard FETCH_HEAD
 elif [[ ! -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
-  info "Cloning BlueBeakend stack from ${REPO_URL}…"
+  info "Cloning BlueBeakend stack (${REPO_BRANCH}) from ${REPO_URL}…"
   git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${INSTALL_DIR}" 2>/dev/null || \
     git clone --depth 1 "${REPO_URL}" "${INSTALL_DIR}"
 fi
@@ -192,15 +206,30 @@ mkdir -p backups nginx/ssl/live/bluebeakend
 # ── 6 & 7. Domain prompt & .env secret generation ──────────────────
 progress_bar 58 "Generating cryptographic secrets & .env"
 
-DETECTED_IP="$(curl -4 -fsSL --max-time 4 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")"
-DOMAIN="${BB_DOMAIN:-}"
-
-if [[ -z "$DOMAIN" && "$NONINTERACTIVE" != "1" && -e /dev/tty ]]; then
-  echo ""
-  read -r -p "  🌐 Enter your domain (press Enter to use VPS IP ${DETECTED_IP}): " USER_DOMAIN < /dev/tty || true
-  DOMAIN="${USER_DOMAIN:-$DETECTED_IP}"
+# Detect GitHub Codespaces environment (even when invoked via sudo)
+CS_NAME="${CODESPACE_NAME:-}"
+CS_DOMAIN="${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}"
+if [[ -z "$CS_NAME" && -f /workspaces/.codespaces/shared/environment-variables.json ]]; then
+  CS_NAME="$(jq -r '.CODESPACE_NAME // empty' /workspaces/.codespaces/shared/environment-variables.json 2>/dev/null || true)"
+  CS_DOM_JSON="$(jq -r '.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN // empty' /workspaces/.codespaces/shared/environment-variables.json 2>/dev/null || true)"
+  [[ -n "$CS_DOM_JSON" ]] && CS_DOMAIN="$CS_DOM_JSON"
 fi
-DOMAIN="${DOMAIN:-$DETECTED_IP}"
+
+DETECTED_IP="$(curl -4 -fsSL --max-time 4 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")"
+DEFAULT_HOST="${DETECTED_IP}"
+DEFAULT_PROTO="http"
+if [[ -n "$CS_NAME" ]]; then
+  DEFAULT_HOST="${CS_NAME}-${HTTP_PORT}.${CS_DOMAIN}"
+  DEFAULT_PROTO="https"
+fi
+
+DOMAIN="${BB_DOMAIN:-}"
+if [[ -z "$DOMAIN" && ! -f "${INSTALL_DIR}/.env" && "$NONINTERACTIVE" != "1" && -e /dev/tty ]]; then
+  echo ""
+  read -r -p "  🌐 Enter your domain (press Enter to use ${DEFAULT_HOST}): " USER_DOMAIN < /dev/tty || true
+  DOMAIN="${USER_DOMAIN:-$DEFAULT_HOST}"
+fi
+DOMAIN="${DOMAIN:-$DEFAULT_HOST}"
 
 if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
   POSTGRES_PASSWORD="$(openssl rand -hex 32)"
@@ -208,15 +237,20 @@ if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
   REDIS_PASSWORD="$(openssl rand -hex 32)"
   MINIO_ROOT_PASSWORD="$(openssl rand -hex 32)"
   ADMIN_EMAIL="${BB_ADMIN_EMAIL:-admin@bluebeakend.local}"
-  ADMIN_PASSWORD="${BB_ADMIN_PASSWORD:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 16)}"
+  ADMIN_PASSWORD="${BB_ADMIN_PASSWORD:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-16)}"
   API_KEY="bb_live_$(openssl rand -hex 20)"
+
+  PROTO_VAL="http"
+  [[ "$DOMAIN" == *".${CS_DOMAIN}" ]] && PROTO_VAL="https"
 
   cat > "${INSTALL_DIR}/.env" <<EOF
 # Auto-generated by BlueBeakend installer on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 BB_VERSION=${BB_VERSION}
 BB_ENV=production
 BB_DOMAIN=${DOMAIN}
-BB_PROTOCOL=http
+BB_PROTOCOL=${PROTO_VAL}
+BB_HTTP_PORT=${HTTP_PORT}
+BB_HTTPS_PORT=${HTTPS_PORT}
 
 POSTGRES_USER=bluebeakend
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -258,10 +292,17 @@ EOF
   ok "Generated secure .env secrets"
 else
   info "Existing .env detected — preserving existing secrets"
+  if [[ -n "${BB_DOMAIN:-}" ]]; then
+    sed -i "s|^BB_DOMAIN=.*|BB_DOMAIN=${BB_DOMAIN}|" "${INSTALL_DIR}/.env"
+  fi
 fi
 
+set -a
 # shellcheck disable=SC1091
 source "${INSTALL_DIR}/.env"
+set +a
+HTTP_PORT="${BB_HTTP_PORT:-$HTTP_PORT}"
+HTTPS_PORT="${BB_HTTPS_PORT:-$HTTPS_PORT}"
 
 # Generate fallback self-signed TLS cert if Let's Encrypt cert isn't present yet
 if [[ ! -f "${INSTALL_DIR}/nginx/ssl/live/bluebeakend/fullchain.pem" ]]; then
@@ -271,33 +312,52 @@ if [[ ! -f "${INSTALL_DIR}/nginx/ssl/live/bluebeakend/fullchain.pem" ]]; then
     -out "${INSTALL_DIR}/nginx/ssl/live/bluebeakend/fullchain.pem" >/dev/null 2>&1
 fi
 
-# ── 8. Launch Docker Compose stack ─────────────────────────────────
-progress_bar 74 "Building & starting BlueBeakend containers"
-docker compose up -d --build
+# Stop conflicting default host web servers occupying port 80 if present
+for host_srv in apache2 httpd; do
+  if systemctl is-active --quiet "$host_srv" 2>/dev/null; then
+    warn "Stopping conflicting host service '${host_srv}' on port ${HTTP_PORT}…"
+    systemctl disable --now "$host_srv" >/dev/null 2>&1 || true
+  fi
+done
+
+# ── 8. Build core image once & launch Docker Compose stack ─────────
+progress_bar 68 "Building BlueBeakend core image (Admin UI + API + Realtime + S3)"
+docker compose build api
+
+progress_bar 78 "Starting PostgreSQL, Redis, S3 Storage, API, Realtime & Nginx"
+docker compose up -d --remove-orphans
 
 # ── 9. Wait for healthchecks to pass ───────────────────────────────
-progress_bar 86 "Waiting for service healthchecks"
+progress_bar 88 "Waiting for service healthchecks"
 ATTEMPTS=0
-until curl -fsSL "http://127.0.0.1/healthz" >/dev/null 2>&1; do
+HEALTH_OK=0
+until curl -fsSL "http://127.0.0.1:${HTTP_PORT}/healthz" >/dev/null 2>&1; do
   ATTEMPTS=$(( ATTEMPTS + 1 ))
   if (( ATTEMPTS > 60 )); then
-    warn "Healthcheck timed out after 120s — run 'bb logs' to inspect container output."
+    warn "Healthcheck timed out after 120s — printing container status:"
+    docker compose ps || true
+    docker compose logs --tail=25 || true
     break
   fi
   sleep 2
 done
-ok "All BlueBeakend services are up and healthy"
+if curl -fsSL "http://127.0.0.1:${HTTP_PORT}/healthz" >/dev/null 2>&1; then
+  HEALTH_OK=1
+  ok "All BlueBeakend services are up and healthy"
+fi
 
 # ── 10. Configure Firewall (UFW: allow 22, 80, 443) ────────────────
-progress_bar 93 "Configuring firewall (ports 22, 80, 443)"
-if command -v ufw >/dev/null 2>&1; then
+progress_bar 94 "Configuring firewall (ports 22, ${HTTP_PORT}, ${HTTPS_PORT})"
+if [[ -n "$CS_NAME" || -f /.dockerenv ]]; then
+  info "Container / Codespace environment detected — skipping host UFW rules"
+elif command -v ufw >/dev/null 2>&1; then
   ufw default deny incoming >/dev/null 2>&1 || true
   ufw default allow outgoing >/dev/null 2>&1 || true
   ufw allow 22/tcp >/dev/null 2>&1 || true
-  ufw allow 80/tcp >/dev/null 2>&1 || true
-  ufw allow 443/tcp >/dev/null 2>&1 || true
+  ufw allow "${HTTP_PORT}/tcp" >/dev/null 2>&1 || true
+  ufw allow "${HTTPS_PORT}/tcp" >/dev/null 2>&1 || true
   ufw --force enable >/dev/null 2>&1 || true
-  ok "UFW firewall enabled (allowed: 22, 80, 443)"
+  ok "UFW firewall enabled (allowed: 22, ${HTTP_PORT}, ${HTTPS_PORT})"
 elif command -v firewall-cmd >/dev/null 2>&1; then
   systemctl enable --now firewalld >/dev/null 2>&1 || true
   firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
@@ -313,6 +373,15 @@ install -m 0755 "${INSTALL_DIR}/cli/bb" /usr/local/bin/bb
 ln -sf /usr/local/bin/bb /usr/local/bin/bluebeakend
 
 PUBLIC_URL="${BB_PROTOCOL:-http}://${BB_DOMAIN}"
+if [[ "${HTTP_PORT}" != "80" && "${BB_PROTOCOL:-http}" == "http" && "${BB_DOMAIN}" != *:* ]]; then
+  PUBLIC_URL="http://${BB_DOMAIN}:${HTTP_PORT}"
+fi
+
+WS_SCHEME="ws"
+[[ "${PUBLIC_URL}" == https://* ]] && WS_SCHEME="wss"
+WS_HOST="${PUBLIC_URL#http://}"
+WS_HOST="${WS_HOST#https://}"
+
 cat > "${INSTALL_DIR}/credentials.txt" <<CREDS
 ═══════════════════════════════════════════════════════════════
   BLUEBEAKEND v${BB_VERSION} — CREDENTIALS
@@ -321,7 +390,7 @@ cat > "${INSTALL_DIR}/credentials.txt" <<CREDS
   API Endpoint   : ${PUBLIC_URL}
   Admin Console  : ${PUBLIC_URL}/admin
   Swagger Docs   : ${PUBLIC_URL}/docs
-  Realtime WS    : ws://${BB_DOMAIN}/realtime
+  Realtime WS    : ${WS_SCHEME}://${WS_HOST}/realtime
 
   Admin Email    : ${ADMIN_EMAIL}
   Admin Password : ${ADMIN_PASSWORD}
@@ -332,9 +401,15 @@ chmod 600 "${INSTALL_DIR}/credentials.txt"
 
 # ── 12. Print Success Banner ───────────────────────────────────────
 echo ""
-echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}${BOLD}║          ✅  BLUEBEAKEND INSTALLED SUCCESSFULLY!                 ║${NC}"
-echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+if (( HEALTH_OK == 1 )); then
+  echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${GREEN}${BOLD}║          ✅  BLUEBEAKEND INSTALLED SUCCESSFULLY!                 ║${NC}"
+  echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+else
+  echo -e "${YELLOW}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${YELLOW}${BOLD}║       ⚠️  BLUEBEAKEND INSTALLED (STILL WARMING UP)               ║${NC}"
+  echo -e "${YELLOW}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
+fi
 echo ""
 echo -e "  ${BOLD}🌐 API URL        :${NC}  ${CYAN}${PUBLIC_URL}${NC}"
 echo -e "  ${BOLD}🖥️  Admin Console  :${NC}  ${CYAN}${PUBLIC_URL}/admin${NC}"
@@ -342,6 +417,12 @@ echo -e "  ${BOLD}📖 Swagger Docs   :${NC}  ${CYAN}${PUBLIC_URL}/docs${NC}"
 echo -e "  ${BOLD}👤 Admin Email    :${NC}  ${YELLOW}${ADMIN_EMAIL}${NC}"
 echo -e "  ${BOLD}🔒 Admin Password :${NC}  ${YELLOW}${ADMIN_PASSWORD}${NC}"
 echo -e "  ${BOLD}🔑 Project API Key:${NC}  ${GREEN}${API_KEY}${NC}"
+if [[ -n "$CS_NAME" ]]; then
+  CS_URL="https://${CS_NAME}-${HTTP_PORT}.${CS_DOMAIN}"
+  echo ""
+  echo -e "  ${BOLD}☁️  Codespaces URL :${NC}  ${CYAN}${CS_URL}/admin${NC}"
+  echo -e "  ${DIM}Tip: Open the PORTS tab in Codespaces to view/forward port ${HTTP_PORT}.${NC}"
+fi
 echo ""
 echo -e "  ${DIM}Saved to ${INSTALL_DIR}/credentials.txt • Type 'bb' anytime to manage.${NC}"
 echo ""

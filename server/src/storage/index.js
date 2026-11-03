@@ -93,9 +93,10 @@ class MinioStorage {
   }
 
   async init() {
-    const Minio = (await import('minio')).default;
+    const mod = await import('minio');
+    const Client = mod.Client || mod.default?.Client;
     const url = new URL(this.cfg.endpoint);
-    this.client = new Minio.Client({
+    this.client = new Client({
       endPoint: url.hostname,
       port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80),
       useSSL: url.protocol === 'https:',
