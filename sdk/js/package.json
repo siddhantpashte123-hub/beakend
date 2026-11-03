@@ -1,0 +1,29 @@
+{
+  "name": "@bluebeakend/js",
+  "version": "1.0.0",
+  "description": "Official JavaScript & TypeScript SDK for BlueBeakend (Self-Hosted Firebase Alternative)",
+  "type": "module",
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "bluebeakend",
+    "firebase-alternative",
+    "baas",
+    "self-hosted",
+    "realtime",
+    "auth",
+    "storage"
+  ],
+  "license": "MIT"
+}

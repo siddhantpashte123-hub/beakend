@@ -1,0 +1,13 @@
+{
+  "name": "bluebeakend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BlueBeakend — Self-Hosted Firebase Alternative (1-Command VPS Install)",
+  "license": "MIT",
+  "scripts": {
+    "build:admin": "npm --prefix admin run build",
+    "start": "npm --prefix server start",
+    "dev": "npm --prefix server run dev",
+    "test": "npm --prefix server test"
+  }
+}
