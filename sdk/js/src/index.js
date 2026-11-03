@@ -548,6 +548,9 @@ export class Bluebeakend {
       'X-API-Key': this.apiKey,
       ...headers,
     };
+    if (/(\.app\.github\.dev|\.devtunnels\.ms)(:|\/|$)/i.test(this.baseUrl)) {
+      reqHeaders['X-Tunnel-Skip-AntiPhishing-Page'] = '1';
+    }
     if (this._accessToken && !reqHeaders.Authorization) {
       reqHeaders.Authorization = `Bearer ${this._accessToken}`;
     }
