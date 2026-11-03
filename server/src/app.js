@@ -77,7 +77,13 @@ export async function buildApp(opts = {}) {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-API-Key',
+      'X-Tunnel-Skip-AntiPhishing-Page',
+      'ngrok-skip-browser-warning',
+    ],
   });
 
   await app.register(multipart, {

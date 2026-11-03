@@ -225,7 +225,7 @@ button:disabled {
 
     <div class="config-bar" id="configBar">
         <div class="config-hint">
-            Enter your BlueBeakend URL &amp; Project API Key (<code>bb_live_...</code> from Admin Console → <b>API Keys</b> or <code>/opt/bluebeakend/credentials.txt</code>). Make sure Port 80 is set to <b>Public</b> in Codespaces PORTS tab.
+            Enter your BlueBeakend URL &amp; Project API Key (<code>bb_live_...</code> from Admin Console → <b>API Keys</b> or <code>/opt/bluebeakend/credentials.txt</code>). In GitHub Codespaces, set Port <b>80</b> Visibility to <b>Public</b> in the VS Code <b>PORTS</b> tab.
         </div>
         <div class="config-row">
             <input type="text" id="cfgUrl" placeholder="https://your-codespace-80.app.github.dev">
@@ -296,13 +296,22 @@ cfgNameEl.value = userName;
 
 const seenIds = new Set();
 let socket = null;
+let wsConnected = false;
+let restConnected = false;
+let pollTimer = null;
 let reconnectTimer = null;
 let pingTimer = null;
-let reconnectDelay = 2000;
+let reconnectDelay = 2500;
 let manuallyClosed = false;
+let announcedConnect = false;
+let lastErrorShown = "";
 
 function isValidApiKey(k) {
     return /^bb_(live|test)_[0-9a-f]{40}$/i.test(String(k || "").trim());
+}
+
+function isDevTunnelHost(url) {
+    return /(\.app\.github\.dev|\.devtunnels\.ms)(:|\/|$)/i.test(url);
 }
 
 function buildWsUrl() {
@@ -314,12 +323,36 @@ function buildWsUrl() {
     return finalWs + "/realtime?apiKey=" + encodeURIComponent(apiKey);
 }
 
+// Fetch wrapper that automatically sends X-Tunnel-Skip-AntiPhishing-Page on GitHub Codespaces
+// (bypasses Microsoft DevTunnels HTML warning gate on cross-origin browser requests),
+// with automatic fallback if an older server hasn't reloaded CORS allowedHeaders yet.
+async function bbFetch(path, options) {
+    const opts = options || {};
+    const baseHeaders = Object.assign({}, opts.headers || {});
+    if (isDevTunnelHost(apiUrl)) {
+        try {
+            return await fetch(apiUrl + path, Object.assign({}, opts, {
+                headers: Object.assign({}, baseHeaders, { "X-Tunnel-Skip-AntiPhishing-Page": "1" })
+            }));
+        } catch (_) {
+            // Retry without custom tunnel header if older server rejected preflight
+        }
+    }
+    return fetch(apiUrl + path, Object.assign({}, opts, { headers: baseHeaders }));
+}
+
 function toggleConfig(forceOpen) {
     if (typeof forceOpen === "boolean") {
         configBarEl.classList.toggle("open", forceOpen);
     } else {
         configBarEl.classList.toggle("open");
     }
+}
+
+function stopAllTimers() {
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 }
 
 function saveConfigAndConnect() {
@@ -341,17 +374,19 @@ function saveConfigAndConnect() {
     localStorage.setItem("blueee_user_name", userName);
 
     toggleConfig(false);
-    reconnectDelay = 2000;
+    reconnectDelay = 2500;
+    announcedConnect = false;
+    lastErrorShown = "";
 
+    manuallyClosed = true;
+    stopAllTimers();
     if (socket) {
-        manuallyClosed = true;
         try { socket.close(); } catch (_) {}
         socket = null;
     }
-    if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-    }
+    wsConnected = false;
+    restConnected = false;
+    manuallyClosed = false;
     connect();
 }
 
@@ -391,6 +426,8 @@ function addMessage(text, type, senderLabel, isoTime, msgId) {
 }
 
 function systemMessage(text) {
+    if (text === lastErrorShown) return;
+    lastErrorShown = text;
     const div = document.createElement("div");
     div.className = "system";
     div.textContent = text;
@@ -404,16 +441,27 @@ function updateStatus(text, color) {
 }
 
 // =========================================================
-// LOAD CHAT HISTORY FROM BLUEBEAKEND DATABASE
+// SYNC MESSAGES FROM BLUEBEAKEND DATABASE
 // =========================================================
 
-async function loadHistory() {
+async function syncMessages() {
     try {
-        const res = await fetch(
-            apiUrl + "/api/v1/db/" + COLLECTION_NAME + "?orderBy=_createdAt:asc&limit=50",
+        const res = await bbFetch(
+            "/api/v1/db/" + COLLECTION_NAME + "?orderBy=_createdAt:asc&limit=60",
             { headers: { "X-API-Key": apiKey } }
         );
-        if (!res.ok) return;
+        if (res.status === 401 || res.status === 403) {
+            restConnected = false;
+            updateStatus("Invalid API Key", "#f87171");
+            systemMessage("Invalid or revoked API Key — click ⚙ Connection above and paste your bb_live_... key.");
+            toggleConfig(true);
+            stopAllTimers();
+            return false;
+        }
+        const ct = res.headers.get("content-type") || "";
+        if (!res.ok || !ct.includes("application/json")) {
+            return false;
+        }
         const data = await res.json();
         const docs = Array.isArray(data.docs) ? data.docs : [];
         for (const doc of docs) {
@@ -429,16 +477,35 @@ async function loadHistory() {
                 dedupeKey
             );
         }
-    } catch (err) {
-        console.warn("Could not load chat history:", err);
+        if (!restConnected) {
+            restConnected = true;
+            lastErrorShown = "";
+            updateStatus(wsConnected ? "Connected" : "Connected (Live Sync)", "#4ade80");
+            if (!announcedConnect) {
+                announcedConnect = true;
+                systemMessage("Connected to BlueBeakend.");
+            }
+        }
+        return true;
+    } catch (_) {
+        return false;
     }
 }
 
+function startPollingFallback() {
+    if (pollTimer) return;
+    pollTimer = setInterval(function() {
+        if (!wsConnected) {
+            syncMessages();
+        }
+    }, 1500);
+}
+
 // =========================================================
-// CONNECT WEBSOCKET TO BLUEBEAKEND (/realtime)
+// CONNECT (HYBRID WEBSOCKET + CODESPACES TUNNEL FALLBACK)
 // =========================================================
 
-function connect() {
+async function connect() {
     if (!isValidApiKey(apiKey)) {
         updateStatus("API Key Required", "#facc15");
         toggleConfig(true);
@@ -446,21 +513,36 @@ function connect() {
         return;
     }
 
+    manuallyClosed = false;
+    if (!restConnected && !wsConnected) {
+        updateStatus("Connecting...", "#facc15");
+    }
+
+    // 1. Verify REST connectivity (works across GitHub Codespaces anti-phishing gate via header)
+    const ok = await syncMessages();
+    if (ok) {
+        startPollingFallback();
+    }
+
+    // 2. Open WebSocket for instant push (<10ms) when proxy permits WS upgrade
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
         return;
     }
-
-    manuallyClosed = false;
-    updateStatus("Connecting...", "#facc15");
 
     try {
         socket = new WebSocket(buildWsUrl());
 
         socket.onopen = function() {
+            wsConnected = true;
+            lastErrorShown = "";
             updateStatus("Connected", "#4ade80");
-            reconnectDelay = 2000;
+            reconnectDelay = 2500;
 
-            // Subscribe to BlueBeakend database collection + custom broadcast channel
+            if (!announcedConnect) {
+                announcedConnect = true;
+                systemMessage("Connected to BlueBeakend Realtime.");
+            }
+
             socket.send(JSON.stringify({ action: "subscribe", channel: "db:" + COLLECTION_NAME }));
             socket.send(JSON.stringify({ action: "subscribe", channel: "custom:blueee" }));
 
@@ -471,23 +553,18 @@ function connect() {
                 }
             }, 25000);
 
-            loadHistory();
+            syncMessages();
         };
 
         socket.onmessage = function(event) {
             try {
                 const frame = JSON.parse(event.data);
-
-                // Ignore control & heartbeat frames
                 if (
                     frame.event === "connected" ||
                     frame.event === "subscribed" ||
                     frame.event === "published" ||
                     frame.event === "pong"
                 ) {
-                    if (frame.event === "connected") {
-                        systemMessage("Connected to BlueBeakend Realtime.");
-                    }
                     return;
                 }
 
@@ -496,7 +573,6 @@ function connect() {
                     return;
                 }
 
-                // Firestore-style realtime document creation (db:messages)
                 if (frame.event === "doc.created" && frame.payload && frame.payload.doc) {
                     const doc = frame.payload.doc;
                     const msgText = doc.text || doc.message;
@@ -513,7 +589,6 @@ function connect() {
                     return;
                 }
 
-                // Custom broadcast event (e.g. from Admin Console -> Realtime -> Broadcast)
                 if (frame.channel === "custom:blueee" && frame.payload) {
                     const p = frame.payload;
                     const msgText = p.text || p.message || (typeof p === "string" ? p : JSON.stringify(p));
@@ -526,40 +601,50 @@ function connect() {
                         p.msgId || null
                     );
                 }
-            } catch (_) {
-                addMessage(event.data, "bot", "Server");
-            }
+            } catch (_) {}
         };
 
         socket.onclose = function(event) {
+            wsConnected = false;
             if (pingTimer) {
                 clearInterval(pingTimer);
                 pingTimer = null;
             }
-            updateStatus("Disconnected", "#f87171");
 
             if (event.code === 4001) {
-                systemMessage("Authentication failed (4001): Invalid or revoked API key. Click ⚙ Connection above to update your bb_live_... key.");
+                restConnected = false;
+                updateStatus("Invalid API Key", "#f87171");
+                systemMessage("Authentication failed (4001): Invalid API key. Click ⚙ Connection above to update.");
                 toggleConfig(true);
-                return; // Stop reconnect loop when key is invalid
+                stopAllTimers();
+                return;
             }
 
+            // If REST Live Sync is working (e.g. GitHub Codespaces blocked cross-origin WS cookie),
+            // stay cleanly Connected via Live Sync without spamming disconnect messages!
+            if (restConnected) {
+                updateStatus("Connected (Live Sync)", "#4ade80");
+                startPollingFallback();
+                return;
+            }
+
+            updateStatus("Disconnected", "#f87171");
             if (!manuallyClosed) {
-                if (event.code === 1006) {
-                    systemMessage("Connection closed (check that Port 80 Visibility is set to Public in GitHub Codespaces PORTS tab). Retrying...");
-                } else {
-                    systemMessage("Connection lost. Reconnecting...");
-                }
+                systemMessage("Cannot reach backend — in VS Code open the PORTS tab, right-click Port 80 → Port Visibility → Public (and ensure server is updated).");
                 reconnect();
             }
         };
 
         socket.onerror = function() {
-            updateStatus("Connection error", "#f87171");
+            if (!restConnected) {
+                updateStatus("Disconnected", "#f87171");
+            }
         };
-    } catch (error) {
-        updateStatus("Connection failed", "#f87171");
-        reconnect();
+    } catch (_) {
+        if (!restConnected) {
+            updateStatus("Connection failed", "#f87171");
+            reconnect();
+        }
     }
 }
 
@@ -568,7 +653,7 @@ function reconnect() {
     reconnectTimer = setTimeout(function() {
         reconnectTimer = null;
         connect();
-        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+        reconnectDelay = Math.min(reconnectDelay * 1.5, 15000);
     }, reconnectDelay);
 }
 
@@ -580,19 +665,22 @@ async function sendMessage() {
     const text = inputEl.value.trim();
     if (!text) return;
 
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-        systemMessage("Backend is not connected. Click ⚙ Connection above to verify URL & API Key.");
-        return;
+    if (!wsConnected && !restConnected) {
+        const ok = await syncMessages();
+        if (!ok) {
+            systemMessage("Backend is not connected yet — check VS Code PORTS tab → Port 80 → Public.");
+            return;
+        }
+        startPollingFallback();
     }
 
     inputEl.value = "";
     const msgId = "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
 
-    // Optimistically show message on right side
     addMessage(text, "user", userName, new Date().toISOString(), msgId);
 
     try {
-        const res = await fetch(apiUrl + "/api/v1/db/" + COLLECTION_NAME, {
+        const res = await bbFetch("/api/v1/db/" + COLLECTION_NAME, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -611,15 +699,14 @@ async function sendMessage() {
             throw new Error((errJson.error && errJson.error.message) || ("HTTP " + res.status));
         }
     } catch (err) {
-        // Fallback: broadcast over WebSocket custom channel if REST call failed
-        try {
+        if (wsConnected && socket && socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({
                 action: "publish",
                 channel: "custom:blueee",
                 eventName: "chat.message",
                 payload: { text: text, sender: userName, clientId: clientId, msgId: msgId }
             }));
-        } catch (_) {
+        } else {
             systemMessage("Unable to send message: " + err.message);
         }
     }
