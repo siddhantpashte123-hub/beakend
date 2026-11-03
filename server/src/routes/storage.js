@@ -17,8 +17,25 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export function originFromReq(req) {
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   if (!host) return config.publicUrl();
-  const proto = req.headers['x-forwarded-proto'] || config.protocol || 'http';
-  return `${String(proto).split(',')[0].trim()}://${String(host).split(',')[0].trim()}`;
+  const cleanHost = String(host).split(',')[0].trim();
+
+  let proto = req.headers['x-forwarded-proto'];
+  if (!proto && req.headers['x-forwarded-ssl'] === 'on') proto = 'https';
+  if (!proto && typeof req.headers['cf-visitor'] === 'string' && req.headers['cf-visitor'].includes('"https"')) {
+    proto = 'https';
+  }
+  if (!proto) {
+    const ref = req.headers.origin || req.headers.referer || '';
+    if (typeof ref === 'string' && ref.startsWith('https://')) {
+      try {
+        if (new URL(ref).host === cleanHost) proto = 'https';
+      } catch {}
+    }
+  }
+  if (!proto && cleanHost.endsWith('.app.github.dev')) proto = 'https';
+  proto = proto || config.protocol || 'http';
+
+  return `${String(proto).split(',')[0].trim()}://${cleanHost}`;
 }
 
 export async function storageRoutes(app, ctx) {

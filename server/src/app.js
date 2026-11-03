@@ -183,6 +183,25 @@ export async function buildApp(opts = {}) {
       { prefix: '/api/v1/admin' }
     );
 
+    // ── Serve official browser ESM SDK at /sdk/bluebeakend.js ──
+    app.get('/sdk/bluebeakend.js', async (_req, reply) => {
+      const sdkCandidates = [
+        resolve(__dirname, '../../sdk/js/src/index.js'),
+        resolve(__dirname, '../sdk-js/index.js'),
+      ];
+      for (const p of sdkCandidates) {
+        if (existsSync(p)) {
+          const js = await readFile(p, 'utf8');
+          return reply
+            .header('Access-Control-Allow-Origin', '*')
+            .header('Cache-Control', 'public, max-age=300')
+            .type('application/javascript; charset=utf-8')
+            .send(js);
+        }
+      }
+      return reply.code(404).send('// SDK bundle not found');
+    });
+
     // ── Serve Next.js 14 Admin Dashboard under /admin ─────────
     const adminDir = resolveAdminDistDir();
     if (adminDir) {

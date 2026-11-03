@@ -24,6 +24,7 @@ COPY server/package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
 COPY server/ ./
+COPY sdk/js/src/index.js ./sdk-js/index.js
 COPY --from=admin-builder /build/admin/out ./admin-dist
 
 ENV NODE_ENV=production
