@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Blueee Chat</title>
+
+<style>
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    background: #0b0d14;
+    color: white;
+    height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.chat {
+    width: 100%;
+    max-width: 900px;
+    height: 92vh;
+    background: #131722;
+    border: 1px solid #293044;
+    border-radius: 16px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.header {
+    padding: 18px 20px;
+    background: #181e2b;
+    border-bottom: 1px solid #293044;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+}
+
+.logo {
+    font-size: 22px;
+    font-weight: bold;
+    color: #8295ff;
+}
+
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.status {
+    font-size: 12px;
+    color: #f87171;
+}
+
+.cfg-btn {
+    background: #252d3d;
+    border: 1px solid #343e53;
+    color: #cbd5e1;
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    cursor: pointer;
+    font-weight: normal;
+}
+
+.cfg-btn:hover {
+    background: #303a4f;
+}
+
+.config-bar {
+    padding: 14px 20px;
+    background: #101521;
+    border-bottom: 1px solid #293044;
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.config-bar.open {
+    display: flex;
+}
+
+.config-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.config-row input {
+    padding: 10px 12px;
+    font-size: 13px;
+}
+
+.config-hint {
+    font-size: 12px;
+    color: #94a3b8;
+    line-height: 1.4;
+}
+
+.messages {
+    flex: 1;
+    padding: 22px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.message {
+    max-width: 75%;
+    padding: 12px 16px;
+    border-radius: 13px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.user {
+    align-self: flex-end;
+    background: #5969df;
+}
+
+.bot {
+    align-self: flex-start;
+    background: #252d3d;
+}
+
+.sender {
+    font-size: 11px;
+    font-weight: bold;
+    color: #93c5fd;
+    margin-bottom: 4px;
+}
+
+.time {
+    font-size: 10px;
+    color: #c4c9dc;
+    margin-top: 6px;
+}
+
+.input-area {
+    padding: 16px;
+    background: #181e2b;
+    border-top: 1px solid #293044;
+    display: flex;
+    gap: 10px;
+}
+
+input {
+    flex: 1;
+    min-width: 0;
+    background: #252d3d;
+    border: 1px solid #343e53;
+    padding: 15px;
+    border-radius: 10px;
+    color: white;
+    outline: none;
+    font-size: 14px;
+}
+
+input:focus {
+    border-color: #7185ff;
+}
+
+button {
+    border: none;
+    background: #6879ef;
+    color: white;
+    padding: 0 22px;
+    border-radius: 10px;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+button:hover {
+    background: #5063dc;
+}
+
+button:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
+.system {
+    align-self: center;
+    color: #9ca3af;
+    font-size: 12px;
+    padding: 6px 12px;
+    text-align: center;
+}
+
+@media(max-width:600px) {
+    .chat {
+        height: 100vh;
+        border-radius: 0;
+    }
+
+    .message {
+        max-width: 88%;
+    }
+}
+</style>
+</head>
+
+<body>
+
+<div class="chat">
+
+    <div class="header">
+        <div class="logo">✦ Blueee Chat</div>
+        <div class="header-right">
+            <div class="status" id="status">● Connecting...</div>
+            <button type="button" class="cfg-btn" onclick="toggleConfig()">⚙ Connection</button>
+        </div>
+    </div>
+
+    <div class="config-bar" id="configBar">
+        <div class="config-hint">
+            Enter your BlueBeakend URL &amp; Project API Key (<code>bb_live_...</code> from Admin Console → <b>API Keys</b> or <code>/opt/bluebeakend/credentials.txt</code>). Make sure Port 80 is set to <b>Public</b> in Codespaces PORTS tab.
+        </div>
+        <div class="config-row">
+            <input type="text" id="cfgUrl" placeholder="https://your-codespace-80.app.github.dev">
+            <input type="password" id="cfgKey" placeholder="bb_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+        </div>
+        <div class="config-row">
+            <input type="text" id="cfgName" placeholder="Your display name (e.g. Siddhant)">
+            <button type="button" style="padding: 10px 18px;" onclick="saveConfigAndConnect()">Save &amp; Connect</button>
+        </div>
+    </div>
+
+    <div class="messages" id="messages">
+        <div class="message bot">
+            Welcome to Blueee Chat! 👋
+            <div class="time">System</div>
+        </div>
+    </div>
+
+    <div class="input-area">
+        <input
+            type="text"
+            id="messageInput"
+            placeholder="Type your message..."
+            autocomplete="off"
+        >
+        <button id="sendButton" onclick="sendMessage()">
+            Send ➤
+        </button>
+    </div>
+
+</div>
+
+<script>
+// =========================================================
+// BLUEBEAKEND CONFIGURATION
+// Paste your real bb_live_... key below OR enter it in the
+// "⚙ Connection" bar inside the page (saved in localStorage).
+// =========================================================
+
+const DEFAULT_API_URL = "https://automatic-space-capybara-544w6j4gp47f754r-80.app.github.dev";
+const DEFAULT_API_KEY = ""; // Optional: put your "bb_live_..." key here, or paste via UI
+const COLLECTION_NAME = "messages";
+
+// =========================================================
+// STATE & ELEMENTS
+// =========================================================
+
+const messagesEl = document.getElementById("messages");
+const inputEl = document.getElementById("messageInput");
+const statusEl = document.getElementById("status");
+const configBarEl = document.getElementById("configBar");
+const cfgUrlEl = document.getElementById("cfgUrl");
+const cfgKeyEl = document.getElementById("cfgKey");
+const cfgNameEl = document.getElementById("cfgName");
+
+const clientId = sessionStorage.getItem("blueee_client_id") || ("u_" + Math.random().toString(36).slice(2, 10));
+sessionStorage.setItem("blueee_client_id", clientId);
+
+let apiUrl = (localStorage.getItem("blueee_api_url") || DEFAULT_API_URL).replace(/\/+$/, "");
+let apiKey = (localStorage.getItem("blueee_api_key") || DEFAULT_API_KEY).trim();
+let userName = (localStorage.getItem("blueee_user_name") || "User-" + clientId.slice(-4)).trim();
+
+cfgUrlEl.value = apiUrl;
+cfgKeyEl.value = apiKey;
+cfgNameEl.value = userName;
+
+const seenIds = new Set();
+let socket = null;
+let reconnectTimer = null;
+let pingTimer = null;
+let reconnectDelay = 2000;
+let manuallyClosed = false;
+
+function isValidApiKey(k) {
+    return /^bb_(live|test)_[0-9a-f]{40}$/i.test(String(k || "").trim());
+}
+
+function buildWsUrl() {
+    const clean = apiUrl.replace(/\/+$/, "");
+    const wsBase = clean.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://");
+    const finalWs = (window.location.protocol === "https:")
+        ? wsBase.replace(/^ws:\/\//i, "wss://")
+        : wsBase;
+    return finalWs + "/realtime?apiKey=" + encodeURIComponent(apiKey);
+}
+
+function toggleConfig(forceOpen) {
+    if (typeof forceOpen === "boolean") {
+        configBarEl.classList.toggle("open", forceOpen);
+    } else {
+        configBarEl.classList.toggle("open");
+    }
+}
+
+function saveConfigAndConnect() {
+    apiUrl = cfgUrlEl.value.trim().replace(/\/+$/, "");
+    apiKey = cfgKeyEl.value.trim();
+    userName = cfgNameEl.value.trim() || ("User-" + clientId.slice(-4));
+
+    if (!apiUrl) {
+        systemMessage("Please enter your BlueBeakend HTTPS URL.");
+        return;
+    }
+    if (!isValidApiKey(apiKey)) {
+        systemMessage("Invalid API Key format — paste your full bb_live_... key from Admin Console → API Keys.");
+        return;
+    }
+
+    localStorage.setItem("blueee_api_url", apiUrl);
+    localStorage.setItem("blueee_api_key", apiKey);
+    localStorage.setItem("blueee_user_name", userName);
+
+    toggleConfig(false);
+    reconnectDelay = 2000;
+
+    if (socket) {
+        manuallyClosed = true;
+        try { socket.close(); } catch (_) {}
+        socket = null;
+    }
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+    connect();
+}
+
+// =========================================================
+// UI HELPERS
+// =========================================================
+
+function addMessage(text, type, senderLabel, isoTime, msgId) {
+    if (msgId) {
+        if (seenIds.has(msgId)) return;
+        seenIds.add(msgId);
+    }
+
+    const div = document.createElement("div");
+    div.className = "message " + type;
+
+    if (type === "bot" && senderLabel) {
+        const senderDiv = document.createElement("div");
+        senderDiv.className = "sender";
+        senderDiv.textContent = senderLabel;
+        div.appendChild(senderDiv);
+    }
+
+    const content = document.createElement("div");
+    content.textContent = String(text);
+
+    const time = document.createElement("div");
+    time.className = "time";
+    const dt = isoTime ? new Date(isoTime) : new Date();
+    time.textContent = isNaN(dt.getTime()) ? new Date().toLocaleTimeString() : dt.toLocaleTimeString();
+
+    div.appendChild(content);
+    div.appendChild(time);
+
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function systemMessage(text) {
+    const div = document.createElement("div");
+    div.className = "system";
+    div.textContent = text;
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function updateStatus(text, color) {
+    statusEl.textContent = "● " + text;
+    statusEl.style.color = color;
+}
+
+// =========================================================
+// LOAD CHAT HISTORY FROM BLUEBEAKEND DATABASE
+// =========================================================
+
+async function loadHistory() {
+    try {
+        const res = await fetch(
+            apiUrl + "/api/v1/db/" + COLLECTION_NAME + "?orderBy=_createdAt:asc&limit=50",
+            { headers: { "X-API-Key": apiKey } }
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        const docs = Array.isArray(data.docs) ? data.docs : [];
+        for (const doc of docs) {
+            const msgText = doc.text || doc.message;
+            if (!msgText) continue;
+            const isMine = doc.clientId === clientId;
+            const dedupeKey = doc.msgId || doc._id;
+            addMessage(
+                msgText,
+                isMine ? "user" : "bot",
+                doc.sender || "User",
+                doc._createdAt,
+                dedupeKey
+            );
+        }
+    } catch (err) {
+        console.warn("Could not load chat history:", err);
+    }
+}
+
+// =========================================================
+// CONNECT WEBSOCKET TO BLUEBEAKEND (/realtime)
+// =========================================================
+
+function connect() {
+    if (!isValidApiKey(apiKey)) {
+        updateStatus("API Key Required", "#facc15");
+        toggleConfig(true);
+        systemMessage("Paste your bb_live_... Project API Key above and click Save & Connect.");
+        return;
+    }
+
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+        return;
+    }
+
+    manuallyClosed = false;
+    updateStatus("Connecting...", "#facc15");
+
+    try {
+        socket = new WebSocket(buildWsUrl());
+
+        socket.onopen = function() {
+            updateStatus("Connected", "#4ade80");
+            reconnectDelay = 2000;
+
+            // Subscribe to BlueBeakend database collection + custom broadcast channel
+            socket.send(JSON.stringify({ action: "subscribe", channel: "db:" + COLLECTION_NAME }));
+            socket.send(JSON.stringify({ action: "subscribe", channel: "custom:blueee" }));
+
+            if (pingTimer) clearInterval(pingTimer);
+            pingTimer = setInterval(function() {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ action: "ping" }));
+                }
+            }, 25000);
+
+            loadHistory();
+        };
+
+        socket.onmessage = function(event) {
+            try {
+                const frame = JSON.parse(event.data);
+
+                // Ignore control & heartbeat frames
+                if (
+                    frame.event === "connected" ||
+                    frame.event === "subscribed" ||
+                    frame.event === "published" ||
+                    frame.event === "pong"
+                ) {
+                    if (frame.event === "connected") {
+                        systemMessage("Connected to BlueBeakend Realtime.");
+                    }
+                    return;
+                }
+
+                if (frame.event === "error") {
+                    systemMessage("Server error: " + (frame.message || "Unknown error"));
+                    return;
+                }
+
+                // Firestore-style realtime document creation (db:messages)
+                if (frame.event === "doc.created" && frame.payload && frame.payload.doc) {
+                    const doc = frame.payload.doc;
+                    const msgText = doc.text || doc.message;
+                    if (!msgText) return;
+                    const isMine = doc.clientId === clientId;
+                    const dedupeKey = doc.msgId || doc._id;
+                    addMessage(
+                        msgText,
+                        isMine ? "user" : "bot",
+                        doc.sender || "User",
+                        doc._createdAt || frame.ts,
+                        dedupeKey
+                    );
+                    return;
+                }
+
+                // Custom broadcast event (e.g. from Admin Console -> Realtime -> Broadcast)
+                if (frame.channel === "custom:blueee" && frame.payload) {
+                    const p = frame.payload;
+                    const msgText = p.text || p.message || (typeof p === "string" ? p : JSON.stringify(p));
+                    const isMine = p.clientId === clientId;
+                    addMessage(
+                        msgText,
+                        isMine ? "user" : "bot",
+                        p.sender || "Broadcast",
+                        frame.ts,
+                        p.msgId || null
+                    );
+                }
+            } catch (_) {
+                addMessage(event.data, "bot", "Server");
+            }
+        };
+
+        socket.onclose = function(event) {
+            if (pingTimer) {
+                clearInterval(pingTimer);
+                pingTimer = null;
+            }
+            updateStatus("Disconnected", "#f87171");
+
+            if (event.code === 4001) {
+                systemMessage("Authentication failed (4001): Invalid or revoked API key. Click ⚙ Connection above to update your bb_live_... key.");
+                toggleConfig(true);
+                return; // Stop reconnect loop when key is invalid
+            }
+
+            if (!manuallyClosed) {
+                if (event.code === 1006) {
+                    systemMessage("Connection closed (check that Port 80 Visibility is set to Public in GitHub Codespaces PORTS tab). Retrying...");
+                } else {
+                    systemMessage("Connection lost. Reconnecting...");
+                }
+                reconnect();
+            }
+        };
+
+        socket.onerror = function() {
+            updateStatus("Connection error", "#f87171");
+        };
+    } catch (error) {
+        updateStatus("Connection failed", "#f87171");
+        reconnect();
+    }
+}
+
+function reconnect() {
+    if (manuallyClosed || reconnectTimer) return;
+    reconnectTimer = setTimeout(function() {
+        reconnectTimer = null;
+        connect();
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+    }, reconnectDelay);
+}
+
+// =========================================================
+// SEND MESSAGE (Persists to PostgreSQL + Broadcasts Live)
+// =========================================================
+
+async function sendMessage() {
+    const text = inputEl.value.trim();
+    if (!text) return;
+
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+        systemMessage("Backend is not connected. Click ⚙ Connection above to verify URL & API Key.");
+        return;
+    }
+
+    inputEl.value = "";
+    const msgId = "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+
+    // Optimistically show message on right side
+    addMessage(text, "user", userName, new Date().toISOString(), msgId);
+
+    try {
+        const res = await fetch(apiUrl + "/api/v1/db/" + COLLECTION_NAME, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-API-Key": apiKey
+            },
+            body: JSON.stringify({
+                text: text,
+                sender: userName,
+                clientId: clientId,
+                msgId: msgId
+            })
+        });
+
+        if (!res.ok) {
+            const errJson = await res.json().catch(function() { return {}; });
+            throw new Error((errJson.error && errJson.error.message) || ("HTTP " + res.status));
+        }
+    } catch (err) {
+        // Fallback: broadcast over WebSocket custom channel if REST call failed
+        try {
+            socket.send(JSON.stringify({
+                action: "publish",
+                channel: "custom:blueee",
+                eventName: "chat.message",
+                payload: { text: text, sender: userName, clientId: clientId, msgId: msgId }
+            }));
+        } catch (_) {
+            systemMessage("Unable to send message: " + err.message);
+        }
+    }
+}
+
+inputEl.addEventListener("keydown", function(event) {
+    if (event.key === "Enter") {
+        sendMessage();
+    }
+});
+
+connect();
+</script>
+
+</body>
+</html>
