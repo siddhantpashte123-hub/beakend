@@ -202,6 +202,21 @@ export async function buildApp(opts = {}) {
       return reply.code(404).send('// SDK bundle not found');
     });
 
+    // ── Serve Blueee Chat sample app at /chat ──────────────────
+    app.get('/chat', async (_req, reply) => {
+      const chatCandidates = [
+        resolve(__dirname, '../../examples/blueee-chat/index.html'),
+        resolve(__dirname, '../examples/blueee-chat/index.html'),
+      ];
+      for (const p of chatCandidates) {
+        if (existsSync(p)) {
+          const html = await readFile(p, 'utf8');
+          return reply.type('text/html; charset=utf-8').send(html);
+        }
+      }
+      return reply.code(404).send('Chat example not found');
+    });
+
     // ── Serve Next.js 14 Admin Dashboard under /admin ─────────
     const adminDir = resolveAdminDistDir();
     if (adminDir) {

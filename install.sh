@@ -442,6 +442,16 @@ fi
 progress_bar 94 "Configuring firewall (ports 22, ${HTTP_PORT}, ${HTTPS_PORT})"
 if [[ -n "$CS_NAME" || -f /.dockerenv ]]; then
   info "Container / Codespace environment detected — skipping host UFW rules"
+  if [[ -n "$CS_NAME" ]] && command -v gh >/dev/null 2>&1; then
+    CS_GH_TOKEN="${GITHUB_TOKEN:-}"
+    if [[ -z "$CS_GH_TOKEN" && -f /workspaces/.codespaces/shared/environment-variables.json ]]; then
+      CS_GH_TOKEN="$(jq -r '.GITHUB_TOKEN // empty' /workspaces/.codespaces/shared/environment-variables.json 2>/dev/null || true)"
+    fi
+    if [[ -n "$CS_GH_TOKEN" ]]; then
+      GITHUB_TOKEN="$CS_GH_TOKEN" gh codespace ports visibility "${HTTP_PORT}:public" -c "$CS_NAME" >/dev/null 2>&1 && \
+        ok "Set GitHub Codespaces port ${HTTP_PORT} visibility to Public" || true
+    fi
+  fi
 elif command -v ufw >/dev/null 2>&1; then
   ufw default deny incoming >/dev/null 2>&1 || true
   ufw default allow outgoing >/dev/null 2>&1 || true
