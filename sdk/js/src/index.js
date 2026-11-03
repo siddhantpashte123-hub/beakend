@@ -24,9 +24,13 @@ function normalizeBaseUrl({ baseUrl, authDomain, secure }) {
 }
 
 function normalizeWsUrl(baseUrl, realtimeUrl) {
-  if (realtimeUrl) return String(realtimeUrl);
+  const pageHttps = typeof window !== 'undefined' && window.location?.protocol === 'https:';
+  if (realtimeUrl) {
+    const raw = String(realtimeUrl);
+    return pageHttps ? raw.replace(/^ws:\/\//i, 'wss://') : raw;
+  }
   const u = new URL(baseUrl);
-  const proto = u.protocol === 'https:' ? 'wss:' : 'ws:';
+  const proto = u.protocol === 'https:' || pageHttps ? 'wss:' : 'ws:';
   return `${proto}//${u.host}/realtime`;
 }
 

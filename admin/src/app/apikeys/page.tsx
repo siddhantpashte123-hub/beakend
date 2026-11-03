@@ -87,6 +87,17 @@ export default function ApiKeysPage() {
     }
   };
 
+  const getDisplayConfig = (cfg: Record<string, string>) => {
+    if (typeof window !== 'undefined' && window.location.protocol === 'https:') {
+      return {
+        ...cfg,
+        ...(cfg.storageBucket ? { storageBucket: cfg.storageBucket.replace(/^http:\/\//i, 'https://') } : {}),
+        ...(cfg.realtimeUrl ? { realtimeUrl: cfg.realtimeUrl.replace(/^ws:\/\//i, 'wss://') } : {}),
+      };
+    }
+    return cfg;
+  };
+
   const confirmRevoke = async () => {
     if (!revokeTarget) return;
     try {
@@ -264,13 +275,13 @@ export default function ApiKeysPage() {
         {configModal && (
           <div className="space-y-4">
             <pre className="p-4 rounded-xl bg-slate-950 text-emerald-400 text-xs font-mono overflow-x-auto border border-slate-800">
-              {JSON.stringify(configModal.config, null, 2)}
+              {JSON.stringify(getDisplayConfig(configModal.config), null, 2)}
             </pre>
             <div className="flex justify-end gap-2">
               <Button
                 variant="outline"
                 onClick={async () => {
-                  await copyToClipboard(JSON.stringify(configModal.config, null, 2));
+                  await copyToClipboard(JSON.stringify(getDisplayConfig(configModal.config), null, 2));
                   toast('Config JSON copied to clipboard!', { variant: 'success' });
                 }}
               >
